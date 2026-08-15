@@ -67,7 +67,7 @@ construction are intentionally next.
 
 - `function name(a, b) { ... }`
 - integer and string literals
-- `number`, `string`, `boolean`, `void`, and `any` annotations are accepted
+- `number`, `string`, `boolean`, and `void` annotations are accepted
 - `let` and `const` declarations
 - local variables and integer parameters
 - `+`, `-`, `*`, `/`
@@ -84,13 +84,15 @@ construction are intentionally next.
 - `console.log(<numeric expression>)` and `console.log("text")`
 
 Annotations are checked for the supported scalar and numeric-array subset.
+`any` and implicit function types are rejected until a checked boxed-value
+path exists; this prevents dynamic values from entering raw native operations.
 There is no control flow in the type checker for closures, objects, imports,
 or garbage collector semantics yet. Numeric arrays currently use a native
 preallocated storage path for the benchmark workload.
 
-Untyped declarations may still be accepted while inference is being built;
-that does not make JavaScript a supported target. TypeScript permits inferred
-types, and Nexa will type-check inferred types before native code generation.
+Inferred local declarations are accepted when their initializer has a concrete
+supported type. Untyped function parameters and return values are rejected
+until inference and boxed-value lowering are implemented.
 
 ## Dependencies
 

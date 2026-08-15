@@ -16,14 +16,15 @@ mod ir;
 fn type_annotation(ann: Option<&swc_ecma_ast::TsTypeAnn>) -> Result<Option<Ty>, String> {
     let Some(ann) = ann else { return Ok(None); };
     match &*ann.type_ann {
-        TsType::TsKeywordType(k) => Ok(Some(match k.kind { TsKeywordTypeKind::TsNumberKeyword => Ty::Number, TsKeywordTypeKind::TsBooleanKeyword => Ty::Boolean, TsKeywordTypeKind::TsStringKeyword => Ty::String, TsKeywordTypeKind::TsVoidKeyword => Ty::Void, TsKeywordTypeKind::TsAnyKeyword => Ty::Any, _ => return Err("Nexa supports only number, boolean, string, void, and any type annotations".into()) })),
+        TsType::TsKeywordType(k) => Ok(Some(match k.kind { TsKeywordTypeKind::TsNumberKeyword => Ty::Number, TsKeywordTypeKind::TsBooleanKeyword => Ty::Boolean, TsKeywordTypeKind::TsStringKeyword => Ty::String, TsKeywordTypeKind::TsVoidKeyword => Ty::Void, TsKeywordTypeKind::TsAnyKeyword => return Err("Nexa does not compile any through the raw typed ABI; use a concrete type".into()), _ => return Err("Nexa supports only number, boolean, string, void, and number[] type annotations".into()) })),
         TsType::TsArrayType(a) => match &*a.elem_type { TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsNumberKeyword => Ok(Some(Ty::NumberArray)), _ => Err("Nexa currently supports only number[] arrays".into()) },
         TsType::TsUnionOrIntersectionType(_) => Err("Nexa union/intersection type checking is not implemented yet".into()),
         _ => Err("Nexa type-level checker supports only scalar keyword types".into()),
     }
 }
 
-fn compatible(expected: Ty, actual: Ty) -> bool { expected == Ty::Any || actual == Ty::Any || expected == actual }
+fn compatible(expected: Ty, actual: Ty) -> bool { expected == actual }
+fn required_type(ann: Option<&swc_ecma_ast::TsTypeAnn>, what: &str) -> Result<Ty, String> { type_annotation(ann)?.ok_or_else(|| format!("Nexa requires a concrete type for {what}; implicit any cannot enter native code")) }
 fn check_expr(e: &SExpr, env: &HashMap<String, Ty>, fns: &HashMap<String, FnSig>) -> Result<Ty, String> {
     match e {
         SExpr::Lit(Lit::Num(_)) => Ok(Ty::Number), SExpr::Lit(Lit::Bool(_)) => Ok(Ty::Boolean), SExpr::Lit(Lit::Str(_)) => Ok(Ty::String),
@@ -42,7 +43,7 @@ fn check_expr(e: &SExpr, env: &HashMap<String, Ty>, fns: &HashMap<String, FnSig>
 
 fn check_stmt(s: &SStmt, env: &mut HashMap<String, Ty>, fns: &HashMap<String, FnSig>, ret: Ty) -> Result<(), String> {
     match s {
-        SStmt::Decl(Decl::Var(v)) => for d in &v.decls { let Pat::Ident(i) = &d.name else { return Err("Nexa local declarations require identifiers".into()); }; let actual = d.init.as_ref().map(|x| check_expr(x, env, fns)).transpose()?.unwrap_or(Ty::Any); let declared = type_annotation(i.type_ann.as_deref())?.unwrap_or(actual); if !compatible(declared, actual) { return Err(format!("initializer type {actual:?} does not match {declared:?}")); } env.insert(i.id.sym.to_string(), declared); },
+        SStmt::Decl(Decl::Var(v)) => for d in &v.decls { let Pat::Ident(i) = &d.name else { return Err("Nexa local declarations require identifiers".into()); }; let actual = d.init.as_ref().map(|x| check_expr(x, env, fns)).transpose()?.unwrap_or(Ty::Any); if actual == Ty::Any { return Err(format!("Nexa requires an initializer or concrete annotation for {}", i.id.sym)); } let declared = type_annotation(i.type_ann.as_deref())?.unwrap_or(actual); if !compatible(declared, actual) { return Err(format!("initializer type {actual:?} does not match {declared:?}")); } env.insert(i.id.sym.to_string(), declared); },
         SStmt::Expr(e) => { check_expr(&e.expr, env, fns)?; },
         SStmt::Return(r) => { let actual = r.arg.as_ref().map(|x| check_expr(x, env, fns)).transpose()?.unwrap_or(Ty::Void); if !compatible(ret, actual) { return Err(format!("return type {actual:?} does not match {ret:?}")); } },
         SStmt::Block(b) => for s in &b.stmts { check_stmt(s, env, fns, ret)?; },
@@ -56,8 +57,8 @@ fn check_stmt(s: &SStmt, env: &mut HashMap<String, Ty>, fns: &HashMap<String, Fn
 
 fn check_module(module: &SwcModule) -> Result<(), String> {
     let mut fns = HashMap::new();
-    for item in &module.body { if let ModuleItem::Stmt(SStmt::Decl(Decl::Fn(f))) = item { let params = f.function.params.iter().map(|p| match &p.pat { Pat::Ident(i) => type_annotation(i.type_ann.as_deref()).map(|x| x.unwrap_or(Ty::Any)), _ => Err("Nexa function parameters require identifiers".into()) }).collect::<Result<Vec<_>, String>>()?; let ret = type_annotation(f.function.return_type.as_deref())?.unwrap_or(Ty::Any); fns.insert(f.ident.sym.to_string(), FnSig { params, ret }); } }
-    for item in &module.body { if let ModuleItem::Stmt(SStmt::Decl(Decl::Fn(f))) = item { let mut env = HashMap::new(); for p in &f.function.params { let Pat::Ident(i) = &p.pat else { return Err("Nexa function parameters require identifiers".into()); }; env.insert(i.id.sym.to_string(), type_annotation(i.type_ann.as_deref())?.unwrap_or(Ty::Any)); } let ret = type_annotation(f.function.return_type.as_deref())?.unwrap_or(Ty::Any); if let Some(body) = &f.function.body { for s in &body.stmts { check_stmt(s, &mut env, &fns, ret)?; } } } }
+    for item in &module.body { if let ModuleItem::Stmt(SStmt::Decl(Decl::Fn(f))) = item { let params = f.function.params.iter().map(|p| match &p.pat { Pat::Ident(i) => required_type(i.type_ann.as_deref(), "function parameter"), _ => Err("Nexa function parameters require identifiers".into()) }).collect::<Result<Vec<_>, String>>()?; let ret = required_type(f.function.return_type.as_deref(), "function return type")?; fns.insert(f.ident.sym.to_string(), FnSig { params, ret }); } }
+    for item in &module.body { if let ModuleItem::Stmt(SStmt::Decl(Decl::Fn(f))) = item { let mut env = HashMap::new(); for p in &f.function.params { let Pat::Ident(i) = &p.pat else { return Err("Nexa function parameters require identifiers".into()); }; env.insert(i.id.sym.to_string(), required_type(i.type_ann.as_deref(), "function parameter")?); } let ret = required_type(f.function.return_type.as_deref(), "function return type")?; if let Some(body) = &f.function.body { for s in &body.stmts { check_stmt(s, &mut env, &fns, ret)?; } } } }
     Ok(())
 }
 
