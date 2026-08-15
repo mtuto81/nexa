@@ -120,6 +120,15 @@ The standard library will be native-focused: filesystem, processes, sockets,
 HTTP clients/servers, crypto, concurrency, serialization, and OS integration.
 Browser-only APIs are out of scope.
 
+## Parser/checker safety boundary
+
+SWC parsing is completed before any lowering begins, and the checker must
+accept the resulting AST before the temporary lowering parser or Cranelift is
+invoked. This is covered by a regression test for optional chaining:
+SWC accepts `value?.length`, while Nexa rejects the unsupported AST with a
+checker error. Unsupported TS grammar therefore cannot silently fall through
+as a monomorphic native value.
+
 The unchanged `test.ts` acceptance file now compiles and runs. The typed print
 ABI routes boolean expressions to `nexa_print_bool`, so native output uses
 `true`/`false` rather than numeric `1`/`0`; numeric and string values use their

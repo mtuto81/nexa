@@ -62,7 +62,7 @@ fn check_module(module: &SwcModule) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_typescript(source: &str, filename: &str) -> Result<(), String> {
+fn parse_swc_module(source: &str, filename: &str) -> Result<SwcModule, String> {
     let cm: Lrc<SourceMap> = Default::default();
     let fm = cm.new_source_file(FileName::Custom(filename.into()).into(), source.to_string());
     let lexer = Lexer::new(
@@ -75,6 +75,11 @@ fn parse_typescript(source: &str, filename: &str) -> Result<(), String> {
     let module = parser.parse_module().map_err(|e| format!("TypeScript parse error: {e:?}"))?;
     let errors = parser.take_errors();
     if let Some(error) = errors.into_iter().next() { return Err(format!("TypeScript parse error: {error:?}")); }
+    Ok(module)
+}
+
+fn parse_typescript(source: &str, filename: &str) -> Result<(), String> {
+    let module = parse_swc_module(source, filename)?;
     check_module(&module)?;
     Ok(())
 }
@@ -179,3 +184,26 @@ impl Compiler {
 fn main() { if let Err(e) = run() { eprintln!("nexa: {e}"); std::process::exit(1); } }
 fn strip_top_level_entry_call(source: &str) -> String { source.lines().filter(|line| line.trim() != "main();").collect::<Vec<_>>().join("\n") }
 fn run() -> Result<(), String> { let a: Vec<String> = env::args().collect(); if a.len() < 2 { return Err("usage: nexa <source.ts> [-o executable]".into()); } let src = fs::read_to_string(&a[1]).map_err(|e| e.to_string())?; parse_typescript(&src, &a[1])?; let lowered_src = strip_top_level_entry_call(&src); let mut p = Parser { t: lex(&lowered_src)?, p: 0 }; let fs = p.program()?; let ir = ir::lower_program(&fs); if env::var_os("NEXA_DUMP_IR").is_some() { eprintln!("{ir}"); } let mut c = Compiler::new()?; c.compile(&fs)?; let obj = c.m.finish(); let objpath = "/tmp/nexa.o"; fs::write(objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; let out = a.iter().position(|x| x == "-o").and_then(|i| a.get(i + 1)).cloned().unwrap_or_else(|| "a.out".into()); if !Path::new("runtime.c").exists() { return Err("runtime.c is missing".into()); } let status = Command::new("gcc").args([objpath, "runtime.c", "-o", &out]).status().map_err(|e| e.to_string())?; if !status.success() { return Err("link failed".into()); } println!("built {out}"); Ok(()) }
+
+#[cfg(test)]
+mod safety_tests {
+    use super::*;
+
+    #[test]
+    fn swc_accepts_optional_chaining_but_checker_rejects_it_before_lowering() {
+        let source = r#"
+            function main(): number {
+                const value: string = "nexa";
+                console.log(value?.length);
+                return 0;
+            }
+            main();
+        "#;
+        let module = parse_swc_module(source, "optional-chaining.ts")
+            .expect("SWC should accept optional chaining syntax");
+        let error = check_module(&module)
+            .expect_err("the checker must reject an unsupported optional-chain AST");
+        assert!(error.contains("unsupported expression"), "unexpected checker error: {error}");
+        assert!(parse_typescript(source, "optional-chaining.ts").is_err());
+    }
+}
