@@ -1,0 +1,7 @@
+/target/
+*.o
+*.out
+/benchmark
+/nexa-cli
+/nexa-test
+/a.out
