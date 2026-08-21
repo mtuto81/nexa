@@ -55,7 +55,10 @@ function classify(n: number): string {
     return "positive";
   }
 }
-
+extern "C"{
+  function malloc(size: number): Pointer;
+  function free(ptr: Pointer): void;
+}
 function main(): number {
   let a: number = add(3, 4);
   let b: number = sub(10, 4);
@@ -65,7 +68,7 @@ function main(): number {
   let s2: number = sumForLoop(100);
   let even: boolean = isEven(42);
   let label: string = classify(-5);
-
+  let input: string = std.in();
   console.log(a);       // 7
   console.log(b);       // 6
   console.log(f);       // 120
@@ -74,6 +77,7 @@ function main(): number {
   console.log(s2);      // 4950
   console.log(even);    // true
   console.log(label);   // "negative"
+  std.log(input);   // input string
 
   return 0;
 }

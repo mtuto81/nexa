@@ -5,7 +5,7 @@ use crate::{Expr, Fun, Stmt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct ValueId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct BlockId(pub usize);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum IrType { Number, Boolean, String, Any, Void }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum IrType { Number, Boolean, String, NumberArray, ClosureNumber, Class(&'static str), Any, Void, Pointer, TParam }
 
 #[derive(Clone, Debug)] pub enum Inst {
     Const(ValueId, i64),
@@ -35,15 +35,16 @@ impl Builder {
         Expr::Bool(b) => { let v = self.value(IrType::Boolean); self.push(Inst::Const(v, i64::from(*b))); Some((v, IrType::Boolean)) }
         Expr::Var(n) => self.vars.get(n).copied(),
         Expr::Bin(a, op, b) => { let (x, xt) = self.expr(a)?; let (y, yt) = self.expr(b)?; let ty = match op.as_str() { "+" | "-" | "*" | "/" => if xt == IrType::Number && yt == IrType::Number { IrType::Number } else { self.push(Inst::Note(format!("typed arithmetic requires number, got {xt:?} and {yt:?}"))); IrType::Any }, "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||" => IrType::Boolean, _ => { self.push(Inst::Note(format!("unsupported operator {op}"))); IrType::Any } }; let v = self.value(ty); self.push(match op.as_str() { "+" => Inst::Add(v, x, y), "-" => Inst::Sub(v, x, y), "*" => Inst::Mul(v, x, y), "/" => Inst::Div(v, x, y), _ => Inst::Note(format!("boolean operation {op} pending in Cranelift lowering")) }); Some((v, ty)) }
-        Expr::Call(n, args) => { let values: Vec<ValueId> = args.iter().filter_map(|x| self.expr(x).map(|v| v.0)).collect(); let v = self.value(if n == "console.log" { IrType::Void } else { IrType::Any }); if n == "console.log" { if let Some(x) = values.first() { self.push(Inst::Print(*x)); } else { self.push(Inst::Note("string print pending in SSA lowering".into())); } } else { self.push(Inst::Call(v, n.clone(), values)); } Some((v, if n == "console.log" { IrType::Void } else { IrType::Any })) }
-        Expr::Unary(_, _) | Expr::Str(_) | Expr::Array | Expr::Index(_, _) => { self.push(Inst::Note("expression pending in SSA lowering".into())); None }
+        Expr::Call(n, args) | Expr::CallGeneric(n, _, args) => { let values: Vec<ValueId> = args.iter().filter_map(|x| self.expr(x).map(|v| v.0)).collect(); let is_log = n == "console.log" || n == "std.log"; let ty = if is_log { IrType::Void } else if n == "std.in" { IrType::String } else if n == "std.parseNumber" { IrType::Number } else { IrType::Any }; let v = self.value(ty); if is_log { if let Some(x) = values.first() { self.push(Inst::Print(*x)); } else { self.push(Inst::Note("string print pending in SSA lowering".into())); } } else { self.push(Inst::Call(v, n.clone(), values)); } Some((v, ty)) }
+        Expr::Unary(_, _) | Expr::Str(_) | Expr::Array | Expr::Index(_, _) | Expr::Closure(_) | Expr::FieldAccess(_, _) | Expr::MethodCall(_, _, _) | Expr::New(_, _) => { self.push(Inst::Note("expression pending in SSA lowering".into())); None }
     } }
     fn stmt(&mut self, s: &Stmt) { match s {
-        Stmt::Let(n, e) => if let Some(v) = self.expr(e) { self.vars.insert(n.clone(), v); },
+        Stmt::Let(n, _, e) => if let Some(v) = self.expr(e) { self.vars.insert(n.clone(), v); },
         Stmt::Assign(n, e) => if let Some(v) = self.expr(e) { self.vars.insert(n.clone(), v); },
         Stmt::Return(e) => { let v = self.expr(e).map(|x| x.0); self.push(Inst::Return(v)); },
         Stmt::Expr(e) => { self.expr(e); },
-        Stmt::If(_, _, _) | Stmt::While(_, _) | Stmt::For(_, _, _, _) | Stmt::IndexAssign(_, _, _) => self.push(Inst::Note("control-flow block/phi lowering pending".into())),
+        Stmt::Block(ss) => for s in ss { self.stmt(s); },
+        Stmt::If(_, _, _) | Stmt::While(_, _) | Stmt::For(_, _, _, _) | Stmt::IndexAssign(_, _, _) | Stmt::FieldAssign(_, _, _) => self.push(Inst::Note("control-flow block/phi lowering pending".into())),
     } }
 }
 
