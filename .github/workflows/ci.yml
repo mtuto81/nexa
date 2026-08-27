@@ -26,7 +26,7 @@ jobs:
       # the least-friction path for now.
       - name: Install MinGW-w64 (Windows only)
         if: runner.os == 'Windows'
-        uses: bwoodsend/setup-winlibs-action@v2
+        uses: bwoodsend/setup-winlibs-action@v1.16
 
       # The nexa compiler writes an intermediate object file to /tmp/nexa.o
       # then shells out to `gcc /tmp/nexa.o runtime.c -o <out>`.
