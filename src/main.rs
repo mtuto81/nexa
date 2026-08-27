@@ -81,7 +81,19 @@ fn check_expr(e: &SExpr, env: &mut HashMap<String, Ty>, fns: &mut HashMap<String
         SExpr::Array(a) => { for x in a.elems.iter().flatten() { if check_expr(&x.expr, env, fns, classes, generics, insts)? != Ty::Number { return Err("Nexa arrays currently contain only numbers".into()); } } Ok(Ty::NumberArray) }
         SExpr::Member(m) => { let object = check_expr(&m.obj, env, fns, classes, generics, insts)?; match &m.prop { MemberProp::Computed(c) => { if object != Ty::NumberArray && object != Ty::Any { return Err("indexed access requires a number[]".into()); } if !compatible(Ty::Number, check_expr(&c.expr, env, fns, classes, generics, insts)?) { return Err("array index must be a number".into()); } Ok(Ty::Number) }, MemberProp::Ident(field_ident) => { if let Ty::Class(cls_name) = object { let cls = classes.get(cls_name).ok_or_else(|| format!("unknown class {cls_name}"))?; let field_name = field_ident.sym.to_string(); for (name, ty) in &cls.fields { if name == &field_name { return Ok(ir_to_ty(*ty)); } } return Err(format!("unknown field {field_name} on class {cls_name}")); } if object == Ty::Any { return Ok(Ty::Any); } Err("field access on non-class type".into()) }, _ => Err("unsupported member property".into()) } }
         SExpr::Assign(a) => { let new = check_expr(&a.right, env, fns, classes, generics, insts)?; match &a.left { swc_ecma_ast::AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Ident(i)) => { let name = i.id.sym.to_string(); let old = env.get(&name).copied().ok_or_else(|| format!("unknown variable {name}"))?; if a.op != AssignOp::Assign && old != Ty::Number { return Err("compound assignment requires number".into()); } if !compatible(old, new) { return Err(format!("cannot assign {new:?} to {old:?}")); } Ok(old) }, swc_ecma_ast::AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Member(m)) => { if a.op != AssignOp::Assign { return Err("compound array assignment is not implemented".into()); } let object = check_expr(&m.obj, env, fns, classes, generics, insts)?; match object { Ty::NumberArray | Ty::Any => { if let MemberProp::Computed(c) = &m.prop { if !compatible(Ty::Number, check_expr(&c.expr, env, fns, classes, generics, insts)?) { return Err("array index must be a number".into()); } } if !compatible(Ty::Number, new) { return Err("number[] elements must be numbers".into()); } Ok(Ty::Number) }, Ty::Class(cls_name) => { let cls = classes.get(cls_name).ok_or_else(|| format!("unknown class {cls_name}"))?; if let MemberProp::Ident(field_ident) = &m.prop { let field_name = field_ident.sym.to_string(); for (name, ty) in &cls.fields { if name == &field_name { if !compatible(ir_to_ty(*ty), new) { return Err(format!("cannot assign {new:?} to field {field_name} of type {:?}", ir_to_ty(*ty))); } return Ok(new); } } return Err(format!("unknown field {field_name} on class {cls_name}")); } Err("field assignment requires an identifier".into()) }, _ => Err("indexed assignment requires a number[]".into()) } }, _ => Err("Nexa assignments require a local identifier or array element".into()) } }
-        SExpr::Call(c) => { let name = match &c.callee { Callee::Expr(x) => match &**x { SExpr::Ident(i) => i.sym.to_string(), SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Ident(i) if i.sym == "console") && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "log") => "console.log".into(), SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Ident(i) if i.sym == "std") && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "log" || i.sym == "in" || i.sym == "parseNumber") => { let MemberProp::Ident(pi) = &m.prop else { unreachable!() }; format!("std.{}", pi.sym) }, SExpr::Member(m) => { if let MemberProp::Ident(method_ident) = &m.prop { let method_name = method_ident.sym.to_string(); let obj_ty = check_expr(&m.obj, env, fns, classes, generics, insts)?; if let Ty::Class(cls_name) = obj_ty { let sig_name = format!("{}.{}", cls_name, method_name); let sig = fns.get(&sig_name).ok_or_else(|| format!("unknown method {}.{}", cls_name, method_name))?.clone(); if sig.params.len() - 1 != c.args.len() { return Err(format!("method {} expects {} arguments", sig_name, sig.params.len() - 1)); } for (p, a) in sig.params.iter().skip(1).zip(&c.args) { let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(*p, t) { return Err(format!("argument type {t:?} does not match {p:?}")); } } return Ok(sig.ret); } } return Err("cannot call method on non-class type".into()); } _ => return Err("Nexa calls require a named function".into()) }, _ => return Err("unsupported call target".into()) }; let name = if name == "console.log" { "std.log".to_string() } else { name }; if name == "std.log" { if c.args.len() != 1 { return Err("std.log accepts one argument".into()); } let t = check_expr(&c.args[0].expr, env, fns, classes, generics, insts)?; if !matches!(t, Ty::Number | Ty::Boolean | Ty::String) { return Err(format!("std.log does not accept {t:?} values in the raw ABI")); } return Ok(Ty::Void); } if name == "std.in" { if !c.args.is_empty() { return Err("std.in accepts no arguments".into()); } return Ok(Ty::String); } if name == "std.parseNumber" { if c.args.len() != 1 { return Err("std.parseNumber accepts one argument".into()); } let t = check_expr(&c.args[0].expr, env, fns, classes, generics, insts)?; if t != Ty::String && t != Ty::Any { return Err(format!("std.parseNumber expects a string, got {t:?}")); } return Ok(Ty::Number); } if c.type_args.is_some() && !generics.contains_key(&name) { return Err(format!("type arguments are only allowed when calling generic functions; {name} is not generic")); } if let Some(sig) = generics.get(&name) { let Some(targs) = c.type_args.as_deref().map(|t| t.params.as_slice()) else { return Err(format!("generic function {name} requires an explicit type instantiation at every call site, e.g. {name}<number>(...)")); }; if targs.len() != 1 { return Err("Nexa supports only a single type argument per generic call".into()); } let ty = resolve_type_arg(&targs[0])?; if matches!(ty, Ty::Void | Ty::Any) { return Err(format!("cannot instantiate {name} with void or any")); } let subst = |g: &GTy| match g { GTy::Concrete(t) => *t, GTy::Param => ty }; if sig.params.len() != c.args.len() { return Err(format!("function {name} expects {} arguments", sig.params.len())); } for (p, a) in sig.params.iter().zip(&c.args) { let expected = subst(p); let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(expected, t) { return Err(format!("argument type {t:?} does not match {expected:?}")); } } insts.push((name.clone(), ty)); return Ok(subst(&sig.ret)); } if env.get(&name) == Some(&Ty::ClosureNumber) { if !c.args.is_empty() { return Err("Nexa v1 closures take no arguments".into()); } return Ok(Ty::Number); } let sig = fns.get(&name).ok_or_else(|| format!("unknown function {name}"))?.clone(); if sig.params.len() != c.args.len() { return Err(format!("function {name} expects {} arguments", sig.params.len())); } for (p, a) in sig.params.iter().zip(&c.args) { let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(*p, t) { return Err(format!("argument type {t:?} does not match {p:?}")); } } Ok(sig.ret) }
+        SExpr::Call(c) => { let name = match &c.callee { Callee::Expr(x) => match &**x { SExpr::Ident(i) => i.sym.to_string(), SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Ident(i) if i.sym == "console") && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "log") => "console.log".into(),                 SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Ident(i) if i.sym == "std") && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "log" || i.sym == "in" || i.sym == "parseNumber" || i.sym == "toCString" || i.sym == "funcPtr") => { let MemberProp::Ident(pi) = &m.prop else { unreachable!() }; format!("std.{}", pi.sym) }, SExpr::Member(m) => { if let MemberProp::Ident(method_ident) = &m.prop { let method_name = method_ident.sym.to_string(); let obj_ty = check_expr(&m.obj, env, fns, classes, generics, insts)?; if let Ty::Class(cls_name) = obj_ty { let sig_name = format!("{}.{}", cls_name, method_name); let sig = fns.get(&sig_name).ok_or_else(|| format!("unknown method {}.{}", cls_name, method_name))?.clone(); if sig.params.len() - 1 != c.args.len() { return Err(format!("method {} expects {} arguments", sig_name, sig.params.len() - 1)); } for (p, a) in sig.params.iter().skip(1).zip(&c.args) { let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(*p, t) { return Err(format!("argument type {t:?} does not match {p:?}")); } } return Ok(sig.ret); } } return Err("cannot call method on non-class type".into()); } _ => return Err("Nexa calls require a named function".into()) }, _ => return Err("unsupported call target".into()) }; let name = if name == "console.log" { "std.log".to_string() } else { name }; if name == "std.log" { if c.args.len() != 1 { return Err("std.log accepts one argument".into()); } let t = check_expr(&c.args[0].expr, env, fns, classes, generics, insts)?; if !matches!(t, Ty::Number | Ty::Boolean | Ty::String) { return Err(format!("std.log does not accept {t:?} values in the raw ABI")); } return Ok(Ty::Void); } if name == "std.in" { if !c.args.is_empty() { return Err("std.in accepts no arguments".into()); } return Ok(Ty::String); } if name == "std.parseNumber" { if c.args.len() != 1 { return Err("std.parseNumber accepts one argument".into()); } let t = check_expr(&c.args[0].expr, env, fns, classes, generics, insts)?; if t != Ty::String && t != Ty::Any { return Err(format!("std.parseNumber expects a string, got {t:?}")); } return Ok(Ty::Number); } // std.toCString: one-directional string→Pointer conversion. Masks the tag bit
+// to produce a raw C char* pointer into the Nexa string's existing buffer.
+// The returned pointer is only valid while the source string is alive — there is
+// no cross-FFI ownership tracking yet, so this is a known lifetime hazard.
+if name == "std.toCString" { if c.args.len() != 1 { return Err("std.toCString accepts one argument".into()); } let t = check_expr(&c.args[0].expr, env, fns, classes, generics, insts)?; if t != Ty::String && t != Ty::Any { return Err(format!("std.toCString expects a string, got {t:?}")); } return Ok(Ty::Pointer); } // std.funcPtr: compile-time resolution of a Nexa function's address as a C-compatible Pointer.
+// Requires a string literal argument naming the target function.
+// SAFETY: This emits a raw pointer to a Nexa-convention function.  On x86_64 Linux
+// (System V AMD64 ABI) Nexa functions already use the default Cranelift calling
+// convention which matches SystemV, so the pointer is directly callable from C.
+// On platforms where default_call_conv() differs (Windows, Darwin), the pointer
+// must NOT be passed to C without an adapter trampoline — revisiting this is
+// required before v2 multi-platform support.
+if name == "std.funcPtr" { if c.args.len() != 1 { return Err("std.funcPtr accepts one argument".into()); } let func_name = if let SExpr::Lit(Lit::Str(s)) = &*c.args[0].expr { s.value.as_str().unwrap_or("").to_string() } else { return Err("std.funcPtr requires a string literal naming the target function (e.g. std.funcPtr(\"main\"))".into()); }; if env.get(&func_name) == Some(&Ty::ClosureNumber) { return Err(format!("std.funcPtr cannot take the address of closure/capturing function \"{func_name}\"; closures are not representable as C function pointers")); } if !fns.contains_key(&func_name) { return Err(format!("std.funcPtr: unknown function \"{func_name}\"")); } return Ok(Ty::Pointer); } if c.type_args.is_some() && !generics.contains_key(&name) { return Err(format!("type arguments are only allowed when calling generic functions; {name} is not generic")); } if let Some(sig) = generics.get(&name) { let Some(targs) = c.type_args.as_deref().map(|t| t.params.as_slice()) else { return Err(format!("generic function {name} requires an explicit type instantiation at every call site, e.g. {name}<number>(...)")); }; if targs.len() != 1 { return Err("Nexa supports only a single type argument per generic call".into()); } let ty = resolve_type_arg(&targs[0])?; if matches!(ty, Ty::Void | Ty::Any) { return Err(format!("cannot instantiate {name} with void or any")); } let subst = |g: &GTy| match g { GTy::Concrete(t) => *t, GTy::Param => ty }; if sig.params.len() != c.args.len() { return Err(format!("function {name} expects {} arguments", sig.params.len())); } for (p, a) in sig.params.iter().zip(&c.args) { let expected = subst(p); let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(expected, t) { return Err(format!("argument type {t:?} does not match {expected:?}")); } } insts.push((name.clone(), ty)); return Ok(subst(&sig.ret)); } if env.get(&name) == Some(&Ty::ClosureNumber) { if !c.args.is_empty() { return Err("Nexa v1 closures take no arguments".into()); } return Ok(Ty::Number); } let sig = fns.get(&name).ok_or_else(|| format!("unknown function {name}"))?.clone(); if sig.params.len() != c.args.len() { return Err(format!("function {name} expects {} arguments", sig.params.len())); } for (p, a) in sig.params.iter().zip(&c.args) { let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(*p, t) { return Err(format!("argument type {t:?} does not match {p:?}")); } } Ok(sig.ret) }
         SExpr::New(n) => { if let SExpr::Ident(class_ident) = &*n.callee { let class_name = class_ident.sym.to_string(); let cls = classes.get(&class_name).ok_or_else(|| format!("unknown class {class_name}"))?; let ctor_name = &cls.constructor_name; let sig = fns.get(ctor_name).ok_or_else(|| format!("unknown constructor {ctor_name}"))?; if sig.params.len() != n.args.as_deref().unwrap_or(&[]).len() + 1 { return Err(format!("constructor {} expects {} arguments (including implicit this)", ctor_name, sig.params.len())); } Ok(Ty::Class(leak_str(&class_name))) } else { Err("new requires a class name".into()) } }
         SExpr::Arrow(a) => {
             if !a.params.is_empty() { return Err("Nexa v1 closures take no arguments".into()); }
@@ -658,7 +670,7 @@ impl Parser {
                 if let Expr::Var(ref obj_name) = x {
                     if obj_name == "console" && field == "log" {
                         x = Expr::Call("std.log".into(), args);
-                    } else if obj_name == "std" && (field == "log" || field == "in" || field == "parseNumber") {
+                    } else if obj_name == "std" && (field == "log" || field == "in" || field == "parseNumber" || field == "toCString" || field == "funcPtr") {
                         x = Expr::Call(format!("std.{field}"), args);
                     } else {
                         x = Expr::MethodCall(Box::new(x), field, args);
@@ -944,7 +956,7 @@ impl Compiler {
             }
             ir::IrType::Number
         }
-        Expr::Var(n) => self.active_kinds.get(n).copied().unwrap_or(ir::IrType::Any), Expr::Unary(op, _) => if *op == '!' { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Bin(a, op, c) => if op == "+" && self.expr_kind(a) == ir::IrType::String && self.expr_kind(c) == ir::IrType::String { ir::IrType::String } else if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||") { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Call(n, _) | Expr::CallGeneric(n, _, _) => if n == "std.log" { ir::IrType::Void } else if n == "std.in" { ir::IrType::String } else if n == "std.parseNumber" { ir::IrType::Number } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { ir::IrType::Number } else { self.returns.get(n).copied().unwrap_or(ir::IrType::Any) } } }
+        Expr::Var(n) => self.active_kinds.get(n).copied().unwrap_or(ir::IrType::Any), Expr::Unary(op, _) => if *op == '!' { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Bin(a, op, c) => if op == "+" && self.expr_kind(a) == ir::IrType::String && self.expr_kind(c) == ir::IrType::String { ir::IrType::String } else if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||") { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Call(n, _) | Expr::CallGeneric(n, _, _) => if n == "std.log" { ir::IrType::Void } else if n == "std.in" { ir::IrType::String } else if n == "std.parseNumber" { ir::IrType::Number } else if n == "std.toCString" { ir::IrType::Pointer } else if n == "std.funcPtr" { ir::IrType::Pointer } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { ir::IrType::Number } else { self.returns.get(n).copied().unwrap_or(ir::IrType::Any) } } }
     fn emit(&mut self, b: &mut FunctionBuilder, e: &Expr, vars: &HashMap<String, Variable>) -> Result<Value, String> { match e {
         Expr::Num(x) => Ok(b.ins().iconst(types::I64, *x)), Expr::Bool(x) => Ok(b.ins().iconst(types::I64, i64::from(*x))), Expr::Array => { let callee = self.m.declare_func_in_func(self.array_new, b.func); let n = b.ins().iconst(types::I64, 1_000_000); let call = b.ins().call(callee, &[n]); Ok(b.func.dfg.inst_results(call)[0]) }, Expr::Index(a, i) => { let array = self.emit(b, a, vars)?; let index = self.emit(b, i, vars)?; let callee = self.m.declare_func_in_func(self.array_get, b.func); let call = b.ins().call(callee, &[array, index]); Ok(b.func.dfg.inst_results(call)[0]) }, Expr::Var(n) => Ok(b.use_var(*vars.get(n).ok_or_else(|| format!("unknown variable {n}"))?)),
         Expr::New(class_name, args) => {
@@ -991,7 +1003,7 @@ impl Compiler {
         }
         Expr::Unary(op, x) => { let v = self.emit(b, x, vars)?; Ok(if *op == '-' { b.ins().ineg(v) } else { b.ins().icmp_imm(IntCC::Equal, v, 0) }) }
         Expr::Bin(a, op, c) => { let string_add = op == "+" && self.expr_kind(a) == ir::IrType::String && self.expr_kind(c) == ir::IrType::String; let x = self.emit(b, a, vars)?; let y = self.emit(b, c, vars)?; if string_add { let callee = self.m.declare_func_in_func(self.concat_str, b.func); let call = b.ins().call(callee, &[x, y]); return Ok(b.func.dfg.inst_results(call)[0]); } let v = match op.as_str() { "+" => b.ins().iadd(x, y), "-" => b.ins().isub(x, y), "*" => b.ins().imul(x, y), "/" => b.ins().sdiv(x, y), "%" => b.ins().srem(x, y), "==" => b.ins().icmp(IntCC::Equal, x, y), "!=" => b.ins().icmp(IntCC::NotEqual, x, y), "<" => b.ins().icmp(IntCC::SignedLessThan, x, y), "<=" => b.ins().icmp(IntCC::SignedLessThanOrEqual, x, y), ">" => b.ins().icmp(IntCC::SignedGreaterThan, x, y), ">=" => b.ins().icmp(IntCC::SignedGreaterThanOrEqual, x, y), "&&" => b.ins().band(x, y), "||" => b.ins().bor(x, y), _ => return Err(format!("unknown operator {op}")) }; let v = if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=") { b.ins().uextend(types::I64, v) } else { v }; Ok(v) }
-        Expr::Call(n, a) | Expr::CallGeneric(n, _, a) => { if n == "std.log" { if a.len() != 1 { return Err("std.log accepts one expression".into()); } if let Expr::Str(s) = &a[0] { let id = if let Some(id) = self.strings.get(s) { *id } else { let id = self.m.declare_data(&format!("str{}", self.strings.len()), Linkage::Local, false, false).map_err(|e| e.to_string())?; let mut d = DataDescription::new(); d.define(s.as_bytes().to_vec().into_boxed_slice()); self.m.define_data(id, &d).map_err(|e| e.to_string())?; self.strings.insert(s.clone(), id); id }; let gv = self.m.declare_data_in_func(id, b.func); let p = b.ins().symbol_value(types::I64, gv); let l = b.ins().iconst(types::I64, s.len() as i64); let callee = self.m.declare_func_in_func(self.print_str, b.func); let call = b.ins().call(callee, &[p, l]); return Ok(b.func.dfg.inst_results(call)[0]); } let x = self.emit(b, &a[0], vars)?; let fid = if self.expr_kind(&a[0]) == ir::IrType::Boolean { self.print_bool } else { self.print_i64 }; let callee = self.m.declare_func_in_func(fid, b.func); let call = b.ins().call(callee, &[x]); Ok(b.func.dfg.inst_results(call)[0]) } else if n == "std.in" { let callee = self.m.declare_func_in_func(self.stdin_line, b.func); let call = b.ins().call(callee, &[]); Ok(b.func.dfg.inst_results(call)[0]) } else if n == "std.parseNumber" { if a.len() != 1 { return Err("std.parseNumber accepts one expression".into()); } let x = self.emit(b, &a[0], vars)?; let callee = self.m.declare_func_in_func(self.parse_number, b.func); let call = b.ins().call(callee, &[x]); Ok(b.func.dfg.inst_results(call)[0]) } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { let closure_val = b.use_var(*vars.get(n).ok_or_else(|| format!("unknown closure {n}"))?); let callee = self.m.declare_func_in_func(self.closure_call, b.func); let call = b.ins().call(callee, &[closure_val]); Ok(b.func.dfg.inst_results(call)[0]) } else if let Some(&fid) = self.extern_funcs.get(n) { let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(fid, b.func); let call = b.ins().call(callee, &xs); if self.extern_voids.contains(n) { Ok(b.ins().iconst(types::I64, 0)) } else { Ok(b.func.dfg.inst_results(call)[0]) } } else { let id = *self.funcs.get(n).ok_or_else(|| format!("unknown function {n}"))?; let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(id, b.func); let call = b.ins().call(callee, &xs); Ok(b.func.dfg.inst_results(call)[0]) } }
+        Expr::Call(n, a) | Expr::CallGeneric(n, _, a) => { if n == "std.log" { if a.len() != 1 { return Err("std.log accepts one expression".into()); } if let Expr::Str(s) = &a[0] { let id = if let Some(id) = self.strings.get(s) { *id } else { let id = self.m.declare_data(&format!("str{}", self.strings.len()), Linkage::Local, false, false).map_err(|e| e.to_string())?; let mut d = DataDescription::new(); d.define(s.as_bytes().to_vec().into_boxed_slice()); self.m.define_data(id, &d).map_err(|e| e.to_string())?; self.strings.insert(s.clone(), id); id }; let gv = self.m.declare_data_in_func(id, b.func); let p = b.ins().symbol_value(types::I64, gv); let l = b.ins().iconst(types::I64, s.len() as i64); let callee = self.m.declare_func_in_func(self.print_str, b.func); let call = b.ins().call(callee, &[p, l]); return Ok(b.func.dfg.inst_results(call)[0]); } let x = self.emit(b, &a[0], vars)?; let fid = if self.expr_kind(&a[0]) == ir::IrType::Boolean { self.print_bool } else { self.print_i64 }; let callee = self.m.declare_func_in_func(fid, b.func); let call = b.ins().call(callee, &[x]); Ok(b.func.dfg.inst_results(call)[0]) } else if n == "std.in" { let callee = self.m.declare_func_in_func(self.stdin_line, b.func); let call = b.ins().call(callee, &[]); Ok(b.func.dfg.inst_results(call)[0]) } else if n == "std.parseNumber" { if a.len() != 1 { return Err("std.parseNumber accepts one expression".into()); } let x = self.emit(b, &a[0], vars)?; let callee = self.m.declare_func_in_func(self.parse_number, b.func); let call = b.ins().call(callee, &[x]); Ok(b.func.dfg.inst_results(call)[0]) } else if n == "std.toCString" { if a.len() != 1 { return Err("std.toCString accepts one expression".into()); } let x = self.emit(b, &a[0], vars)?; let mask = b.ins().iconst(types::I64, i64::MAX); Ok(b.ins().band(x, mask)) } else if n == "std.funcPtr" { if a.len() != 1 { return Err("std.funcPtr accepts one expression".into()); } let func_name = if let Expr::Str(s) = &a[0] { s.clone() } else { return Err("std.funcPtr requires a string literal".into()); }; let id = *self.funcs.get(&func_name).ok_or_else(|| format!("std.funcPtr: unknown function \"{func_name}\""))?; let func_ref = self.m.declare_func_in_func(id, b.func); Ok(b.ins().func_addr(types::I64, func_ref)) } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { let closure_val = b.use_var(*vars.get(n).ok_or_else(|| format!("unknown closure {n}"))?); let callee = self.m.declare_func_in_func(self.closure_call, b.func); let call = b.ins().call(callee, &[closure_val]); Ok(b.func.dfg.inst_results(call)[0]) } else if let Some(&fid) = self.extern_funcs.get(n) { let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(fid, b.func); let call = b.ins().call(callee, &xs); if self.extern_voids.contains(n) { Ok(b.ins().iconst(types::I64, 0)) } else { Ok(b.func.dfg.inst_results(call)[0]) } } else { let id = *self.funcs.get(n).ok_or_else(|| format!("unknown function {n}"))?; let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(id, b.func); let call = b.ins().call(callee, &xs); Ok(b.func.dfg.inst_results(call)[0]) } }
         Expr::Str(s) => { let id = if let Some(id) = self.strings.get(s) { *id } else { let id = self.m.declare_data(&format!("str{}", self.strings.len()), Linkage::Local, false, false).map_err(|e| e.to_string())?; let mut bytes = s.as_bytes().to_vec(); bytes.push(0); let mut d = DataDescription::new(); d.define(bytes.into_boxed_slice()); self.m.define_data(id, &d).map_err(|e| e.to_string())?; self.strings.insert(s.clone(), id); id }; let gv = self.m.declare_data_in_func(id, b.func); let p = b.ins().symbol_value(types::I64, gv); let tag = b.ins().iconst(types::I64, i64::MIN); Ok(b.ins().bor(p, tag)) }
         Expr::Closure(_) => { let defs = self.closure_defs.get(&self.current_func).ok_or_else(|| format!("no closure definitions for {}", self.current_func))?; let idx = *self.closure_index.entry(self.current_func.clone()).or_insert(0); let def = defs.get(idx).ok_or_else(|| format!("closure index {} out of range for {}", idx, self.current_func))?; self.closure_index.insert(self.current_func.clone(), idx + 1); let env_len = b.ins().iconst(types::I64, def.captures.len() as i64); let callee = self.m.declare_func_in_func(self.env_new, b.func); let call = b.ins().call(callee, &[env_len]); let env = b.func.dfg.inst_results(call)[0]; for (slot, capture) in def.captures.iter().enumerate() { let slot_val = b.ins().iconst(types::I64, slot as i64); let value = b.use_var(*vars.get(&capture.name).ok_or_else(|| format!("unknown capture `{}`", capture.name))?); if capture.mutable { let cell_callee = self.m.declare_func_in_func(self.cell_new, b.func); let cell_call = b.ins().call(cell_callee, &[value]); let cell_ptr = b.func.dfg.inst_results(cell_call)[0]; let cell_var = b.declare_var(types::I64); b.def_var(cell_var, cell_ptr); self.cell_vars.insert(capture.name.clone(), cell_var); self.active_cells.insert(capture.name.clone()); let set_callee = self.m.declare_func_in_func(self.env_set, b.func); b.ins().call(set_callee, &[env, slot_val, cell_ptr]); } else { let set_callee = self.m.declare_func_in_func(self.env_set, b.func); b.ins().call(set_callee, &[env, slot_val, value]); } } let func_ref = self.m.declare_func_in_func(self.closures[&def.name], b.func); let code_ptr = b.ins().func_addr(types::I64, func_ref); let new_callee = self.m.declare_func_in_func(self.closure_new, b.func); let call = b.ins().call(new_callee, &[code_ptr, env]); Ok(b.func.dfg.inst_results(call)[0]) }
     } }
@@ -1619,4 +1631,162 @@ mod safety_tests {
         assert_eq!(lines, vec!["hello, nexa", "hello, codex", "nexa"],
             "p and q must hold independent, non-aliased string field values");
     }
+
+    #[test]
+    fn pointer_field_and_to_cstring_acceptance_compiles_and_runs() {
+        let source = r#"
+            class Widget {
+              handle: Pointer;
+              constructor(h: Pointer) {
+                this.handle = h;
+              }
+            }
+
+            extern "C" {
+              function malloc(size: number): Pointer;
+              function free(ptr: Pointer): void;
+              function puts(s: Pointer): number;
+            }
+
+            function main(): number {
+              let p: Pointer = unsafe { malloc(64) };
+              let w = new Widget(p);
+              unsafe { free(w.handle); }
+
+              let msg: string = "hello from nexa";
+              unsafe { puts(std.toCString(msg)); }
+
+              std.log(1);
+              return 0;
+            }
+        "#;
+        let (classes, functions) = parse_nexa(source).expect("parser should handle Pointer fields and std.toCString");
+        assert_eq!(classes.len(), 1, "should parse Widget class");
+        assert_eq!(classes[0].name, "Widget");
+        assert_eq!(classes[0].fields.len(), 1);
+        assert_eq!(classes[0].fields[0].0, "handle");
+        assert_eq!(classes[0].fields[0].1, ir::IrType::Pointer);
+
+        let (externs, _) = extract_extern_blocks(source).expect("extract extern signatures");
+        assert_eq!(externs.len(), 3);
+        assert_eq!(externs["malloc"].params, vec![Ty::Number]);
+        assert_eq!(externs["malloc"].ret, Ty::Pointer);
+        assert_eq!(externs["free"].params, vec![Ty::Pointer]);
+        assert_eq!(externs["free"].ret, Ty::Void);
+        assert_eq!(externs["puts"].params, vec![Ty::Pointer]);
+        assert_eq!(externs["puts"].ret, Ty::Number);
+
+        let mut c = Compiler::new().expect("compiler init");
+        c.declare_externs(&externs).expect("declare extern imports");
+        c.compile(&classes, &functions).expect("compile pointer field + toCString program");
+        let obj = c.m.finish();
+        let objpath = "/tmp/nexa_test_pointer_field.o";
+        fs::write(objpath, obj.emit().map_err(|e| e.to_string()).unwrap()).unwrap();
+        let status = Command::new("gcc")
+            .args([objpath, "runtime.c", "-o", "/tmp/nexa_test_pointer_field"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gcc link failed: puts/malloc/free must resolve against libc");
+        let output = Command::new("/tmp/nexa_test_pointer_field").output().unwrap();
+        assert!(output.status.success(), "program must exit cleanly");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines, vec!["hello from nexa", "1"],
+            "puts must print the C string, and std.log must print 1");
+    }
+
+    #[test]
+    fn funcptr_valid_acceptance_compiles_and_runs() {
+        let source = r#"
+            extern "C" {
+              function puts(s: Pointer): number;
+            }
+
+            function greet(): number {
+              return 42;
+            }
+
+            function main(): number {
+              let ptr = std.funcPtr("greet");
+              std.log(1);
+              return 0;
+            }
+        "#;
+        let (externs, clean) = extract_extern_blocks(source).expect("extract extern");
+        let (classes, functions) = parse_nexa_with_externs(&clean, &externs).expect("parse funcPtr program");
+        let mut c = Compiler::new().expect("compiler init");
+        c.declare_externs(&externs).expect("declare externs");
+        c.compile(&classes, &functions).expect("compile funcPtr program");
+        let obj = c.m.finish();
+        let objpath = "/tmp/nexa_test_funcptr.o";
+        fs::write(objpath, obj.emit().map_err(|e| e.to_string()).unwrap()).unwrap();
+        let status = Command::new("gcc")
+            .args([objpath, "runtime.c", "-o", "/tmp/nexa_test_funcptr"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gcc link failed");
+        let output = Command::new("/tmp/nexa_test_funcptr").output().unwrap();
+        assert!(output.status.success(), "program must exit cleanly");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "1", "must print 1");
+    }
+
+    #[test]
+    fn funcptr_rejects_closure_at_compile_time() {
+        let source = r#"
+            function main(): number {
+              let counter = 0;
+              let f = () => { counter = counter + 1; return 0; };
+              let ptr = std.funcPtr("f");
+              return 0;
+            }
+        "#;
+        let (externs, clean) = extract_extern_blocks(source).expect("extract extern");
+        let err = compile_with_externs(&clean, &externs).unwrap_err();
+        assert!(
+            err.contains("closure") || err.contains("std.funcPtr"),
+            "should reject closure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn funcptr_rejects_unknown_function_at_compile_time() {
+        let source = r#"
+            function main(): number {
+              let ptr = std.funcPtr("does_not_exist");
+              return 0;
+            }
+        "#;
+        let (externs, clean) = extract_extern_blocks(source).expect("extract extern");
+        let err = compile_with_externs(&clean, &externs).unwrap_err();
+        assert!(
+            err.contains("unknown function"),
+            "should reject unknown function, got: {err}"
+        );
+    }
+
+    #[test]
+    fn funcptr_rejects_non_literal_argument_at_compile_time() {
+        let source = r#"
+            function main(): number {
+              let name = "main";
+              let ptr = std.funcPtr(name);
+              return 0;
+            }
+        "#;
+        let (externs, clean) = extract_extern_blocks(source).expect("extract extern");
+        let err = compile_with_externs(&clean, &externs).unwrap_err();
+        assert!(
+            err.contains("string literal"),
+            "should reject non-literal argument, got: {err}"
+        );
+    }
+}
+
+fn compile_with_externs(source: &str, externs: &HashMap<String, ExternSig>) -> Result<(), String> {
+    let (classes, functions) = parse_nexa_with_externs(source, externs)?;
+    let mut c = Compiler::new().map_err(|e| e.to_string())?;
+    c.declare_externs(externs)?;
+    c.compile(&classes, &functions)?;
+    Ok(())
 }

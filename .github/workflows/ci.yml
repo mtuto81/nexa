@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # --- Platform-specific setup ---
+
+      # Windows: MinGW-w64 provides gcc, which the nexa linker hardcodes.
+      # MSVC would require changing the linker command in source; MinGW is
+      # the least-friction path for now.
+      - name: Install MinGW-w64 (Windows only)
+        if: runner.os == 'Windows'
+        uses: bwoodsend/setup-winlibs-action@v2
+
+      # The nexa compiler writes an intermediate object file to /tmp/nexa.o
+      # then shells out to `gcc /tmp/nexa.o runtime.c -o <out>`.
+      # On Windows /tmp doesn't exist; Rust resolves it to <drive_root>/tmp,
+      # so we must create that directory using pwsh (not bash, which would
+      # create the MSYS2 temp dir instead).
+      - name: Create /tmp for nexa object files (Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $drive = (Get-Location).Drive.Root
+          New-Item -ItemType Directory -Path "${drive}tmp" -Force | Out-Null
+
+      # --- Build and test ---
+
+      - name: Build compiler
+        run: cargo build --release
+
+      - name: Run test suite
+        run: cargo test
+
+      # --- Build and run every .ts file through the compiler ---
+      #
+      # GTK examples (gtk_app.ts, gtk_app_pure.ts) are excluded because they
+      # require GTK development libraries, a C glue compilation step, and a
+      # display server to run — none of which are available in headless CI.
+      # They are covered by the manual build_gtk.sh workflow instead.
+      #
+      # Windows note: MinGW's gcc silently appends .exe to output names
+      # when no extension is given, so binaries become <name>.exe. The
+      # bash shell on Windows resolves this transparently via CreateProcess.
+
+      - name: Compile and run examples
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IS_WIN=false
+          EXE=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            IS_WIN=true
+            NEXA="./target/release/nexa.exe"
+          else
+            NEXA="./target/release/nexa"
+          fi
+
+          # build_and_run <source.ts> <output_name> [stdin_input]
+          #
+          # Compiles the .ts to a native binary via nexa + gcc, then runs it.
+          # If stdin_input is provided it is echoed into the binary's stdin.
+          build_and_run() {
+            local src="$1"
+            local name="$2"
+            local stdin="${3:-}"
+            local bin
+
+            if [[ "${IS_WIN}" == "true" ]]; then
+              bin="./${name}.exe"
+            else
+              bin="./${name}"
+            fi
+
+            echo "--- ${src} ---"
+            ${NEXA} "${src}" -o "${name}"
+
+            if [[ -n "${stdin}" ]]; then
+              echo "${stdin}" | "${bin}"
+            else
+              "${bin}"
+            fi
+            echo ""
+          }
+
+          # ----- examples/ directory -----
+
+          build_and_run examples/arithmetic.ts          ex_arithmetic
+          build_and_run examples/class_counter.ts       ex_class_counter
+          build_and_run examples/class_string_field.ts  ex_class_string_field
+          build_and_run examples/closures.ts            ex_closures
+          build_and_run examples/closure_mutable.ts     ex_closure_mutable
+          build_and_run examples/control_flow.ts        ex_control_flow
+          build_and_run examples/extern_malloc.ts       ex_extern_malloc
+          build_and_run examples/for_loop.ts            ex_for_loop
+          build_and_run examples/generic_identity.ts    ex_generic_identity
+          build_and_run examples/makeCounter.ts         ex_makeCounter
+          build_and_run examples/stats.ts               ex_stats
+          build_and_run examples/typed.ts               ex_typed
+          build_and_run examples/std_hello.ts           ex_std_hello       "nexa"
+          build_and_run examples/parse_number.ts        ex_parse_number    "41"
+
+          # ----- root-level files -----
+
+          build_and_run test.ts        ex_test          ""
+          build_and_run benchmark.ts   ex_benchmark
+          build_and_run cli.ts         ex_cli
+          build_and_run closure.ts     ex_closure_root
+
+          echo "All examples compiled and ran successfully."

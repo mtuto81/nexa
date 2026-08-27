@@ -1,4 +1,4 @@
-# Nexa prototype
+-# Nexa prototype
 
 This is a deliberately small native TypeScript compiler experiment for
 non-web applications.
