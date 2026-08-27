@@ -6,6 +6,10 @@ use crate::{Expr, Fun, Stmt};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct ValueId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct BlockId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum IrType { Number, Boolean, String, NumberArray, ClosureNumber, Class(&'static str), Any, Void, Pointer, TParam }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum Ty { Number, Boolean, String, NumberArray, Void, Any, Class(&'static str), ClosureNumber, Pointer }
+
+pub fn ty_to_ir(ty: Ty) -> IrType { match ty { Ty::Number => IrType::Number, Ty::Boolean => IrType::Boolean, Ty::String => IrType::String, Ty::NumberArray => IrType::NumberArray, Ty::ClosureNumber => IrType::ClosureNumber, Ty::Class(name) => IrType::Class(name), Ty::Void => IrType::Void, Ty::Any => IrType::Any, Ty::Pointer => IrType::Pointer } }
+pub fn ir_to_ty(ir_ty: IrType) -> Ty { match ir_ty { IrType::Number => Ty::Number, IrType::Boolean => Ty::Boolean, IrType::String => Ty::String, IrType::NumberArray => Ty::NumberArray, IrType::ClosureNumber => Ty::ClosureNumber, IrType::Class(name) => Ty::Class(name), IrType::Void => Ty::Void, IrType::Any | IrType::TParam => Ty::Any, IrType::Pointer => Ty::Pointer } }
 
 #[derive(Clone, Debug)] pub enum Inst {
     Const(ValueId, i64),

@@ -7,7 +7,7 @@ function main(): number {
         } else {
             total = total + i;
         }
-        i = i + 1;
+        i = i + 2;
     }
     console.log(total);
     return total;
