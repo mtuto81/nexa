@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::stdlib;
 use crate::{Expr, Fun, Stmt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct ValueId(pub usize);
@@ -39,7 +40,7 @@ impl Builder {
         Expr::Bool(b) => { let v = self.value(IrType::Boolean); self.push(Inst::Const(v, i64::from(*b))); Some((v, IrType::Boolean)) }
         Expr::Var(n) => self.vars.get(n).copied(),
         Expr::Bin(a, op, b) => { let (x, xt) = self.expr(a)?; let (y, yt) = self.expr(b)?; let ty = match op.as_str() { "+" | "-" | "*" | "/" => if xt == IrType::Number && yt == IrType::Number { IrType::Number } else { self.push(Inst::Note(format!("typed arithmetic requires number, got {xt:?} and {yt:?}"))); IrType::Any }, "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||" => IrType::Boolean, _ => { self.push(Inst::Note(format!("unsupported operator {op}"))); IrType::Any } }; let v = self.value(ty); self.push(match op.as_str() { "+" => Inst::Add(v, x, y), "-" => Inst::Sub(v, x, y), "*" => Inst::Mul(v, x, y), "/" => Inst::Div(v, x, y), _ => Inst::Note(format!("boolean operation {op} pending in Cranelift lowering")) }); Some((v, ty)) }
-        Expr::Call(n, args) | Expr::CallGeneric(n, _, args) => { let values: Vec<ValueId> = args.iter().filter_map(|x| self.expr(x).map(|v| v.0)).collect(); let is_log = n == "console.log" || n == "std.log";         let ty = if is_log { IrType::Void } else if n == "std.in" { IrType::String } else if n == "std.parseNumber" { IrType::Number } else if n == "std.toCString" { IrType::Pointer } else if n == "std.funcPtr" { IrType::Pointer } else { IrType::Any }; let v = self.value(ty); if is_log { if let Some(x) = values.first() { self.push(Inst::Print(*x)); } else { self.push(Inst::Note("string print pending in SSA lowering".into())); } } else { self.push(Inst::Call(v, n.clone(), values)); } Some((v, ty)) }
+        Expr::Call(n, args) | Expr::CallGeneric(n, _, args) => { let values: Vec<ValueId> = args.iter().filter_map(|x| self.expr(x).map(|v| v.0)).collect(); let is_log = stdlib::is_log(n);         let ty = if is_log { IrType::Void } else { stdlib::StdOp::of(n).map(|op| op.ir_type()).unwrap_or(IrType::Any) }; let v = self.value(ty); if is_log { if let Some(x) = values.first() { self.push(Inst::Print(*x)); } else { self.push(Inst::Note("string print pending in SSA lowering".into())); } } else { self.push(Inst::Call(v, n.clone(), values)); } Some((v, ty)) }
         Expr::Unary(_, _) | Expr::Str(_) | Expr::Array | Expr::Index(_, _) | Expr::Closure(_) | Expr::FieldAccess(_, _) | Expr::MethodCall(_, _, _) | Expr::New(_, _) => { self.push(Inst::Note("expression pending in SSA lowering".into())); None }
     } }
     fn stmt(&mut self, s: &Stmt) { match s {

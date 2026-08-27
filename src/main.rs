@@ -4,6 +4,7 @@ use swc_ecma_parser::{lexer::Lexer, Parser as SwcParser, StringInput, Syntax, Ts
 use std::{collections::HashMap, env, fs, path::Path, process::Command};
 mod ir;
 mod parser;
+mod stdlib;
 mod codegen;
 
 use parser::{lex, Parser, Tok};

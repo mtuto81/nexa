@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::checker::ClassDef;
 use crate::ir;
 use crate::ir::Ty;
+use crate::stdlib;
 use crate::{leak_str, ClassDecl, Expr, ExternSig, Fun, Stmt};
 
 fn inferred_ir_type(e: &Expr) -> ir::IrType { match e { Expr::Num(_) => ir::IrType::Number, Expr::Bool(_) => ir::IrType::Boolean, Expr::Closure(_) => ir::IrType::ClosureNumber, Expr::New(name, _) => ir::IrType::Class(leak_str(name)), Expr::FieldAccess(_, _) => ir::IrType::Number, _ => ir::IrType::Any } }
@@ -171,7 +172,7 @@ impl Compiler {
             }
             ir::IrType::Number
         }
-        Expr::Var(n) => self.active_kinds.get(n).copied().unwrap_or(ir::IrType::Any), Expr::Unary(op, _) => if *op == '!' { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Bin(a, op, c) => if op == "+" && self.expr_kind(a) == ir::IrType::String && self.expr_kind(c) == ir::IrType::String { ir::IrType::String } else if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||") { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Call(n, _) | Expr::CallGeneric(n, _, _) => if n == "std.log" { ir::IrType::Void } else if n == "std.in" { ir::IrType::String } else if n == "std.parseNumber" { ir::IrType::Number } else if n == "std.toCString" { ir::IrType::Pointer } else if n == "std.funcPtr" { ir::IrType::Pointer } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { ir::IrType::Number } else { self.returns.get(n).copied().unwrap_or(ir::IrType::Any) } } }
+        Expr::Var(n) => self.active_kinds.get(n).copied().unwrap_or(ir::IrType::Any), Expr::Unary(op, _) => if *op == '!' { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Bin(a, op, c) => if op == "+" && self.expr_kind(a) == ir::IrType::String && self.expr_kind(c) == ir::IrType::String { ir::IrType::String } else if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||") { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Call(n, _) | Expr::CallGeneric(n, _, _) => if let Some(op) = stdlib::StdOp::of(n) { op.ir_type() } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { ir::IrType::Number } else { self.returns.get(n).copied().unwrap_or(ir::IrType::Any) } } }
     fn emit(&mut self, b: &mut FunctionBuilder, e: &Expr, vars: &HashMap<String, Variable>) -> Result<Value, String> { match e {
         Expr::Num(x) => Ok(b.ins().iconst(types::I64, *x)), Expr::Bool(x) => Ok(b.ins().iconst(types::I64, i64::from(*x))), Expr::Array => { let callee = self.m.declare_func_in_func(self.array_new, b.func); let n = b.ins().iconst(types::I64, 1_000_000); let call = b.ins().call(callee, &[n]); Ok(b.func.dfg.inst_results(call)[0]) }, Expr::Index(a, i) => { let array = self.emit(b, a, vars)?; let index = self.emit(b, i, vars)?; let callee = self.m.declare_func_in_func(self.array_get, b.func); let call = b.ins().call(callee, &[array, index]); Ok(b.func.dfg.inst_results(call)[0]) }, Expr::Var(n) => Ok(b.use_var(*vars.get(n).ok_or_else(|| format!("unknown variable {n}"))?)),
         Expr::New(class_name, args) => {
@@ -218,8 +219,51 @@ impl Compiler {
         }
         Expr::Unary(op, x) => { let v = self.emit(b, x, vars)?; Ok(if *op == '-' { b.ins().ineg(v) } else { b.ins().icmp_imm(IntCC::Equal, v, 0) }) }
         Expr::Bin(a, op, c) => { let string_add = op == "+" && self.expr_kind(a) == ir::IrType::String && self.expr_kind(c) == ir::IrType::String; let x = self.emit(b, a, vars)?; let y = self.emit(b, c, vars)?; if string_add { let callee = self.m.declare_func_in_func(self.concat_str, b.func); let call = b.ins().call(callee, &[x, y]); return Ok(b.func.dfg.inst_results(call)[0]); } let v = match op.as_str() { "+" => b.ins().iadd(x, y), "-" => b.ins().isub(x, y), "*" => b.ins().imul(x, y), "/" => b.ins().sdiv(x, y), "%" => b.ins().srem(x, y), "==" => b.ins().icmp(IntCC::Equal, x, y), "!=" => b.ins().icmp(IntCC::NotEqual, x, y), "<" => b.ins().icmp(IntCC::SignedLessThan, x, y), "<=" => b.ins().icmp(IntCC::SignedLessThanOrEqual, x, y), ">" => b.ins().icmp(IntCC::SignedGreaterThan, x, y), ">=" => b.ins().icmp(IntCC::SignedGreaterThanOrEqual, x, y), "&&" => b.ins().band(x, y), "||" => b.ins().bor(x, y), _ => return Err(format!("unknown operator {op}")) }; let v = if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=") { b.ins().uextend(types::I64, v) } else { v }; Ok(v) }
-        Expr::Call(n, a) | Expr::CallGeneric(n, _, a) => { if n == "std.log" { if a.len() != 1 { return Err("std.log accepts one expression".into()); } if let Expr::Str(s) = &a[0] { let id = if let Some(id) = self.strings.get(s) { *id } else { let id = self.m.declare_data(&format!("str{}", self.strings.len()), Linkage::Local, false, false).map_err(|e| e.to_string())?; let mut d = DataDescription::new(); d.define(s.as_bytes().to_vec().into_boxed_slice()); self.m.define_data(id, &d).map_err(|e| e.to_string())?; self.strings.insert(s.clone(), id); id }; let gv = self.m.declare_data_in_func(id, b.func); let p = b.ins().symbol_value(types::I64, gv); let l = b.ins().iconst(types::I64, s.len() as i64); let callee = self.m.declare_func_in_func(self.print_str, b.func); let call = b.ins().call(callee, &[p, l]); return Ok(b.func.dfg.inst_results(call)[0]); } let x = self.emit(b, &a[0], vars)?; let fid = if self.expr_kind(&a[0]) == ir::IrType::Boolean { self.print_bool } else { self.print_i64 }; let callee = self.m.declare_func_in_func(fid, b.func); let call = b.ins().call(callee, &[x]); Ok(b.func.dfg.inst_results(call)[0]) } else if n == "std.in" { let callee = self.m.declare_func_in_func(self.stdin_line, b.func); let call = b.ins().call(callee, &[]); Ok(b.func.dfg.inst_results(call)[0]) } else if n == "std.parseNumber" { if a.len() != 1 { return Err("std.parseNumber accepts one expression".into()); } let x = self.emit(b, &a[0], vars)?; let callee = self.m.declare_func_in_func(self.parse_number, b.func); let call = b.ins().call(callee, &[x]); Ok(b.func.dfg.inst_results(call)[0]) } else if n == "std.toCString" { if a.len() != 1 { return Err("std.toCString accepts one expression".into()); } let x = self.emit(b, &a[0], vars)?; let mask = b.ins().iconst(types::I64, i64::MAX); Ok(b.ins().band(x, mask)) } else if n == "std.funcPtr" { if a.len() != 1 { return Err("std.funcPtr accepts one expression".into()); } let func_name = if let Expr::Str(s) = &a[0] { s.clone() } else { return Err("std.funcPtr requires a string literal".into()); }; let id = *self.funcs.get(&func_name).ok_or_else(|| format!("std.funcPtr: unknown function \"{func_name}\""))?; let func_ref = self.m.declare_func_in_func(id, b.func); Ok(b.ins().func_addr(types::I64, func_ref)) } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { let closure_val = b.use_var(*vars.get(n).ok_or_else(|| format!("unknown closure {n}"))?); let callee = self.m.declare_func_in_func(self.closure_call, b.func); let call = b.ins().call(callee, &[closure_val]); Ok(b.func.dfg.inst_results(call)[0]) } else if let Some(&fid) = self.extern_funcs.get(n) { let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(fid, b.func); let call = b.ins().call(callee, &xs); if self.extern_voids.contains(n) { Ok(b.ins().iconst(types::I64, 0)) } else { Ok(b.func.dfg.inst_results(call)[0]) } } else { let id = *self.funcs.get(n).ok_or_else(|| format!("unknown function {n}"))?; let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(id, b.func); let call = b.ins().call(callee, &xs); Ok(b.func.dfg.inst_results(call)[0]) } }
+        Expr::Call(n, a) | Expr::CallGeneric(n, _, a) => { if let Some(op) = stdlib::StdOp::of(n) { stdlib::emit_std_call(self, b, op, a, vars) } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { let closure_val = b.use_var(*vars.get(n).ok_or_else(|| format!("unknown closure {n}"))?); let callee = self.m.declare_func_in_func(self.closure_call, b.func); let call = b.ins().call(callee, &[closure_val]); Ok(b.func.dfg.inst_results(call)[0]) } else if let Some(&fid) = self.extern_funcs.get(n) { let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(fid, b.func); let call = b.ins().call(callee, &xs); if self.extern_voids.contains(n) { Ok(b.ins().iconst(types::I64, 0)) } else { Ok(b.func.dfg.inst_results(call)[0]) } } else { let id = *self.funcs.get(n).ok_or_else(|| format!("unknown function {n}"))?; let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(id, b.func); let call = b.ins().call(callee, &xs); Ok(b.func.dfg.inst_results(call)[0]) } }
         Expr::Str(s) => { let id = if let Some(id) = self.strings.get(s) { *id } else { let id = self.m.declare_data(&format!("str{}", self.strings.len()), Linkage::Local, false, false).map_err(|e| e.to_string())?; let mut bytes = s.as_bytes().to_vec(); bytes.push(0); let mut d = DataDescription::new(); d.define(bytes.into_boxed_slice()); self.m.define_data(id, &d).map_err(|e| e.to_string())?; self.strings.insert(s.clone(), id); id }; let gv = self.m.declare_data_in_func(id, b.func); let p = b.ins().symbol_value(types::I64, gv); let tag = b.ins().iconst(types::I64, i64::MIN); Ok(b.ins().bor(p, tag)) }
         Expr::Closure(_) => { let defs = self.closure_defs.get(&self.current_func).ok_or_else(|| format!("no closure definitions for {}", self.current_func))?; let idx = *self.closure_index.entry(self.current_func.clone()).or_insert(0); let def = defs.get(idx).ok_or_else(|| format!("closure index {} out of range for {}", idx, self.current_func))?; self.closure_index.insert(self.current_func.clone(), idx + 1); let env_len = b.ins().iconst(types::I64, def.captures.len() as i64); let callee = self.m.declare_func_in_func(self.env_new, b.func); let call = b.ins().call(callee, &[env_len]); let env = b.func.dfg.inst_results(call)[0]; for (slot, capture) in def.captures.iter().enumerate() { let slot_val = b.ins().iconst(types::I64, slot as i64); let value = b.use_var(*vars.get(&capture.name).ok_or_else(|| format!("unknown capture `{}`", capture.name))?); if capture.mutable { let cell_callee = self.m.declare_func_in_func(self.cell_new, b.func); let cell_call = b.ins().call(cell_callee, &[value]); let cell_ptr = b.func.dfg.inst_results(cell_call)[0]; let cell_var = b.declare_var(types::I64); b.def_var(cell_var, cell_ptr); self.cell_vars.insert(capture.name.clone(), cell_var); self.active_cells.insert(capture.name.clone()); let set_callee = self.m.declare_func_in_func(self.env_set, b.func); b.ins().call(set_callee, &[env, slot_val, cell_ptr]); } else { let set_callee = self.m.declare_func_in_func(self.env_set, b.func); b.ins().call(set_callee, &[env, slot_val, value]); } } let func_ref = self.m.declare_func_in_func(self.closures[&def.name], b.func); let code_ptr = b.ins().func_addr(types::I64, func_ref); let new_callee = self.m.declare_func_in_func(self.closure_new, b.func); let call = b.ins().call(new_callee, &[code_ptr, env]); Ok(b.func.dfg.inst_results(call)[0]) }
     } }
+}
+
+
+impl stdlib::StdEmitter for Compiler {
+    fn emit_expr(&mut self, b: &mut FunctionBuilder, e: &Expr, vars: &HashMap<String, Variable>) -> Result<Value, String> {
+        self.emit(b, e, vars)
+    }
+    fn expr_is_boolean(&self, e: &Expr) -> bool {
+        self.expr_kind(e) == ir::IrType::Boolean
+    }
+    fn runtime_func(&self, f: stdlib::StdFunc) -> FuncId {
+        match f {
+            stdlib::StdFunc::PrintStr => self.print_str,
+            stdlib::StdFunc::PrintI64 => self.print_i64,
+            stdlib::StdFunc::PrintBool => self.print_bool,
+            stdlib::StdFunc::StdInLine => self.stdin_line,
+            stdlib::StdFunc::ParseNumber => self.parse_number,
+        }
+    }
+    fn func_id(&self, name: &str) -> Option<FuncId> {
+        self.funcs.get(name).copied()
+    }
+    fn intern_string(&mut self, s: &str, null_terminated: bool) -> Result<DataId, String> {
+        if let Some(id) = self.strings.get(s) {
+            return Ok(*id);
+        }
+        let id = self.m.declare_data(&format!("str{}", self.strings.len()), Linkage::Local, false, false).map_err(|e| e.to_string())?;
+        let mut d = DataDescription::new();
+        let mut bytes = s.as_bytes().to_vec();
+        if null_terminated {
+            bytes.push(0);
+        }
+        d.define(bytes.into_boxed_slice());
+        self.m.define_data(id, &d).map_err(|e| e.to_string())?;
+        self.strings.insert(s.to_string(), id);
+        Ok(id)
+    }
+    fn declare_data_in_func(&mut self, id: DataId, func: &mut Function) -> cranelift_codegen::ir::GlobalValue {
+        self.m.declare_data_in_func(id, func)
+    }
+    fn declare_func_in_func(&mut self, id: FuncId, func: &mut Function) -> cranelift_codegen::ir::FuncRef {
+        self.m.declare_func_in_func(id, func)
+    }
 }
