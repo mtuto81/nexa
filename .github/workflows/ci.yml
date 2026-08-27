@@ -73,10 +73,16 @@ jobs:
             NEXA="./target/release/nexa"
           fi
 
+          FAILURES=0
+
           # build_and_run <source.ts> <output_name> [stdin_input]
           #
           # Compiles the .ts to a native binary via nexa + gcc, then runs it.
           # If stdin_input is provided it is echoed into the binary's stdin.
+          #
+          # Nexa programs return a number from main() which becomes the
+          # process exit code — this is not an error.  We only treat a
+          # compilation failure (nexa or gcc) as a real failure.
           build_and_run() {
             local src="$1"
             local name="$2"
@@ -90,12 +96,17 @@ jobs:
             fi
 
             echo "--- ${src} ---"
-            ${NEXA} "${src}" -o "${name}"
+            if ! ${NEXA} "${src}" -o "${name}"; then
+              echo "FAIL: compilation of ${src} failed"
+              FAILURES=$((FAILURES + 1))
+              echo ""
+              return
+            fi
 
             if [[ -n "${stdin}" ]]; then
-              echo "${stdin}" | "${bin}"
+              echo "${stdin}" | "${bin}" || true
             else
-              "${bin}"
+              "${bin}" || true
             fi
             echo ""
           }
@@ -124,4 +135,9 @@ jobs:
           build_and_run cli.ts         ex_cli
           build_and_run closure.ts     ex_closure_root
 
+          echo "---"
+          if [[ ${FAILURES} -gt 0 ]]; then
+            echo "${FAILURES} example(s) failed to compile."
+            exit 1
+          fi
           echo "All examples compiled and ran successfully."
