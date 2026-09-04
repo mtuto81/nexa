@@ -43,7 +43,7 @@ fn visit(path: &Path, stack: &mut Vec<(PathBuf, String)>, done: &mut HashMap<Pat
         let tcanon = fs_canonicalize(target)?;
         let idx = *done.get(&tcanon).ok_or_else(|| format!("internal error: module `{}` was not resolved before import validation", target.display()))?;
         if !order[idx].exports.contains(name) {
-            return Err(format!("`{}` imports `{name}` from `{}`, which does not export it; only exported functions and classes can be imported", loaded.display, order[idx].display));
+            return Err(format!("`{}` imports `{name}` from `{}`, which does not export it; only exported functions, classes, and module-scope globals can be imported", loaded.display, order[idx].display));
         }
     }
     done.insert(canon, order.len());
@@ -94,8 +94,14 @@ fn load_module(path: &Path, display: &str, canon: &Path, owners: &mut HashMap<St
                         locals.insert(c.ident.sym.to_string());
                         cuts.push(export_prefix_cut(&src, off(base, e.span.lo), off(base, c.class.span.lo), display)?);
                     }
-                    Decl::Var(_) => return Err(format!("`{display}`: exporting top-level `let`/`const` is out of scope for this version; only functions and classes may be exported")),
-                    _ => return Err(format!("`{display}`: only top-level function and class declarations may be exported")),
+                    Decl::Var(v) => {
+                        if v.decls.len() != 1 { return Err(format!("`{display}`: only single-declarator top-level `let`/`const` declarations are supported")) }
+                        let swc_ecma_ast::Pat::Ident(p) = &v.decls[0].name else { return Err(format!("`{display}`: top-level global declarations require an identifier")) };
+                        exports.insert(p.id.sym.to_string());
+                        locals.insert(p.id.sym.to_string());
+                        cuts.push(export_prefix_cut(&src, off(base, e.span.lo), off(base, v.span.lo), display)?);
+                    }
+                    _ => return Err(format!("`{display}`: only top-level function, class, and module-scope variable declarations may be exported")),
                 },
                 ModuleDecl::ExportNamed(e) => {
                     if e.src.is_some() { return Err(format!("`{display}`: re-exporting from another module (`export {{ x }} from ...`) is not supported in this version")); }
@@ -123,12 +129,17 @@ fn load_module(path: &Path, display: &str, canon: &Path, owners: &mut HashMap<St
             },
             ModuleItem::Stmt(SStmt::Decl(Decl::Fn(f))) => { locals.insert(f.ident.sym.to_string()); }
             ModuleItem::Stmt(SStmt::Decl(Decl::Class(c))) => { locals.insert(c.ident.sym.to_string()); }
+            ModuleItem::Stmt(SStmt::Decl(Decl::Var(v))) => {
+                if v.decls.len() != 1 { return Err(format!("`{display}`: only single-declarator top-level `let`/`const` declarations are supported")) }
+                let swc_ecma_ast::Pat::Ident(p) = &v.decls[0].name else { return Err(format!("`{display}`: top-level global declarations require an identifier")) };
+                locals.insert(p.id.sym.to_string());
+            }
             _ => {}
         }
     }
     for name in &clause_exports {
         if !locals.contains(name) {
-            return Err(format!("`{display}`: `export {{ {name} }}` refers to a name that is not a top-level function or class declared in this file"));
+            return Err(format!("`{display}`: `export {{ {name} }}` refers to a name that is not a top-level function, class, or module-scope global declared in this file"));
         }
     }
     for name in &locals {

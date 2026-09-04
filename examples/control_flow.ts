@@ -1,5 +1,6 @@
-function main(): number {
-    let total: number = 0;
+let total: number = 0;
+
+function main(total: number): number {
     let i: number = 1;
     while (i <= 5) {
         if (i == 3) {
@@ -7,7 +8,7 @@ function main(): number {
         } else {
             total = total + i;
         }
-        i = i + 2;
+        i = i + 1;
     }
     console.log(total);
     return total;
