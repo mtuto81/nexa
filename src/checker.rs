@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use swc_ecma_ast::{AssignOp, BinaryOp, Callee, ClassMember, Decl, Expr as SExpr, Lit, MemberProp, Module as SwcModule, ModuleItem, Pat, PropName, Stmt as SStmt, TsKeywordTypeKind, TsType};
+use swc_ecma_ast::{AssignOp, BinaryOp, Callee, ClassMember, Decl, Expr as SExpr, KeyValueProp, Lit, MemberProp, Module as SwcModule, ModuleItem, ObjectLit, Pat, Prop, PropName, PropOrSpread, Stmt as SStmt, TsExprWithTypeArgs, TsKeywordTypeKind, TsType, TsTypeElement};
 
 use crate::ir;
 use crate::ir::{ty_to_ir, ir_to_ty, Ty};
@@ -14,16 +14,24 @@ use crate::{leak_str, ExternSig};
 fn ts_type(ty: &TsType) -> Result<Option<Ty>, String> {
     match ty {
         TsType::TsKeywordType(k) => Ok(Some(match k.kind { TsKeywordTypeKind::TsNumberKeyword => Ty::Number, TsKeywordTypeKind::TsBooleanKeyword => Ty::Boolean, TsKeywordTypeKind::TsStringKeyword => Ty::String, TsKeywordTypeKind::TsVoidKeyword => Ty::Void, TsKeywordTypeKind::TsAnyKeyword => return Err("Nexa does not compile any through the raw typed ABI; use a concrete type".into()), _ => return Err("Nexa supports only number, boolean, string, void, and number[] type annotations".into()) })),
-        TsType::TsArrayType(a) => match &*a.elem_type { TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsNumberKeyword => Ok(Some(Ty::NumberArray)), _ => Err("Nexa currently supports only number[] arrays".into()) },
+        TsType::TsArrayType(a) => match &*a.elem_type { TsType::TsKeywordType(k) if k.kind == TsKeywordTypeKind::TsNumberKeyword => Ok(Some(Ty::NumberArray)), TsType::TsTypeRef(r) => match (&r.type_name, r.type_params.as_deref()) { (swc_ecma_ast::TsEntityName::Ident(i), None) if &*i.sym == "f32" => Ok(Some(Ty::Float32Array)), (swc_ecma_ast::TsEntityName::Ident(i), None) if &*i.sym == "f64" => Ok(Some(Ty::Float64Array)), _ => Err("Nexa array element types are number, f32, or f64".into()) }, _ => Err("Nexa array element types are number, f32, or f64".into()) },
         TsType::TsUnionOrIntersectionType(_) => Err("Nexa union/intersection type checking is not implemented yet".into()),
         TsType::TsParenthesizedType(p) => ts_type(&p.type_ann),
         TsType::TsTypeRef(r) => match (&r.type_name, r.type_params.as_deref()) {
             (swc_ecma_ast::TsEntityName::Ident(i), None) if &*i.sym == "Pointer" => Ok(Some(Ty::Pointer)),
+            (swc_ecma_ast::TsEntityName::Ident(i), None) if &*i.sym == "f32" => Ok(Some(Ty::F32)),
+            (swc_ecma_ast::TsEntityName::Ident(i), None) if &*i.sym == "f64" => Ok(Some(Ty::F64)),
             // Any other bare identifier is a fixed-layout class/struct type: a
             // class declared in the same program whose fields define the C
             // layout. This is what lets `class Point { ... }` flow through type
             // annotations and extern "C" signatures as a by-value struct type.
-            (swc_ecma_ast::TsEntityName::Ident(i), None) => Ok(Some(Ty::Class(leak_str(&i.sym)))),
+            // A name registered as a structural interface resolves to the
+            // interface type instead (same layout convention, statically
+            // checked for field-shape compatibility at every use).
+            (swc_ecma_ast::TsEntityName::Ident(i), None) => {
+                let name = leak_str(&i.sym);
+                Ok(Some(if ACTIVE_INTERFACES.with(|c| c.borrow().contains_key(name)) { Ty::Interface(name) } else { Ty::Class(name) }))
+            }
             _ => Err("Nexa supports only a bare class/struct name or the built-in Pointer type reference".into()),
         },
         TsType::TsFnOrConstructorType(swc_ecma_ast::TsFnOrConstructorType::TsFnType(f)) => {
@@ -52,6 +60,12 @@ fn gty_of(t: &TsType, tparam: &str) -> Result<GTy, String> {
 }
 
 thread_local! { static ACTIVE_INST: std::cell::RefCell<Option<(String, Ty)>> = const { std::cell::RefCell::new(None) }; }
+// Structural interfaces (field-shape type checking). Populated during the
+// first pass over the module, consulted whenever `ts_type` resolves a bare
+// identifier annotation (to distinguish `interface Point` from a class) and
+// whenever a class value is checked against an interface expectation. Kept in
+// a thread_local so concurrent test compilations cannot clobber each other.
+thread_local! { static ACTIVE_INTERFACES: std::cell::RefCell<HashMap<String, Vec<(String, Ty)>>> = std::cell::RefCell::new(HashMap::new()); }
 fn resolve_type_arg(t: &TsType) -> Result<Ty, String> {
     if let TsType::TsTypeRef(r) = t {
         if let (swc_ecma_ast::TsEntityName::Ident(i), None) = (&r.type_name, r.type_params.as_deref()) {
@@ -63,6 +77,103 @@ fn resolve_type_arg(t: &TsType) -> Result<Ty, String> {
 }
 
 fn compatible(expected: Ty, actual: Ty) -> bool { expected == actual }
+fn is_float(ty: Ty) -> bool { matches!(ty, Ty::F32 | Ty::F64) }
+fn numeric(ty: Ty) -> bool { ty == Ty::Number || is_float(ty) }
+// Any value flows into a float destination with an explicit float annotation
+// (let, assignment, argument, return, global init): int->float widens
+// implicitly, and f32/f64 convert freely in both directions at the annotated
+// destination (a value that lands in an f32 slot is demoted, mirroring how a
+// literal like 2.5 compiles to the declared type). Float->int is the only
+// conversion callers must spell out, via std.toInt.
+//
+// A class satisfies an interface structurally (real TypeScript shape typing):
+// every interface field must exist on the class with the same type. Because a
+// class instance is a native pointer and interface field access is compiled
+// against the interface's OWN layout, a satisfying class must also declare the
+// shared fields at the same index/offset -- i.e. a superset of the interface
+// with the interface's fields in the same order. Additional class fields are
+// fine. Mismatches produce a precise diagnostic instead of a bare `false`, so
+// callers surface them verbatim.
+fn assignable(expected: Ty, actual: Ty, classes: &HashMap<String, ClassDef>) -> Result<bool, String> {
+    if expected == actual { return Ok(true); }
+    if is_float(expected) && matches!(actual, Ty::Number | Ty::F32 | Ty::F64) { return Ok(true); }
+    if let (Ty::Interface(iname), Ty::Class(cname)) = (expected, actual) {
+        let shapes = ACTIVE_INTERFACES.with(|c| c.borrow().get(iname).cloned()).unwrap_or_default();
+        let cls = classes.get(cname).ok_or_else(|| format!("unknown class {cname}"))?;
+        for (i, (fname, fty)) in shapes.iter().enumerate() {
+            let Some((cname2, cty)) = cls.fields.get(i) else {
+                return Err(format!(
+                    "class {cname} does not satisfy interface {iname}: missing required field `{fname}` \
+                     (a satisfying class must declare the interface's fields at the same positions/offsets)"
+                ));
+            };
+            if cname2 != fname {
+                return Err(format!(
+                    "class {cname} does not satisfy interface {iname}: field at index {i} is `{cname2}` \
+                     but the interface requires `{fname}` (shared fields must be declared in the same order)"
+                ));
+            }
+            if ir_to_ty(*cty) != *fty {
+                return Err(format!(
+                    "class {cname} does not satisfy interface {iname}: field `{fname}` has type {cty:?} \
+                     but the interface requires {fty:?}"
+                ));
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+/// Validity of an swc object literal at a position whose expected type is the
+/// named interface `expected`. Applies the same positional shape-matching rule
+/// as class-to-interface assignability: the literal's fields (names + types,
+/// in declaration order) must line up exactly with the interface's required
+/// fields — this is what makes the interface's known offsets correct for the
+/// synthesized struct the literal compiles to. Inferred shape = field count +
+/// each field's checked type; any mismatch, spread, or non-field prop, or a
+/// non-interface expected type, is rejected.
+fn check_object_literal(obj: &ObjectLit, expected: Ty, env: &mut HashMap<String, Ty>, fns: &mut HashMap<String, FnSig>, classes: &mut HashMap<String, ClassDef>, generics: &HashMap<String, GenSig>, insts: &mut Vec<(String, Ty)>) -> Result<Ty, String> {
+    let Ty::Interface(iname) = expected else {
+        return Err("object literals are supported only where a named interface type is expected (as a function argument or an explicitly-typed `let`); `{ ... }` cannot be an anonymous type in this version".into());
+    };
+    let shapes = ACTIVE_INTERFACES.with(|c| c.borrow().get(iname).cloned()).unwrap_or_default();
+    if obj.props.len() != shapes.len() {
+        let expected_names: Vec<String> = shapes.iter().map(|(n, _)| n.clone()).collect();
+        return Err(format!(
+            "object literal does not match interface {iname}: expected {} field(s) ({}) but found {}",
+            shapes.len(),
+            expected_names.join(", "),
+            obj.props.len()
+        ));
+    }
+    for (i, (fname, fty)) in shapes.iter().enumerate() {
+        match obj.props.get(i) {
+            Some(PropOrSpread::Spread(_)) => return Err("object literal spread syntax is not supported in this version".into()),
+            Some(PropOrSpread::Prop(p)) => match &**p {
+                Prop::KeyValue(KeyValueProp { key, value }) => {
+                    let PropName::Ident(field_ident) = key else { return Err("object literal fields must be simple identifiers".into()); };
+                    if field_ident.sym != *fname {
+                        return Err(format!(
+                            "object literal does not match interface {iname}: field at index {i} is `{}` but the interface requires `{fname}` (fields must be declared in the same order)",
+                            field_ident.sym
+                        ));
+                    }
+                    if matches!(&**value, SExpr::Object(_)) {
+                        return Err(format!("object literal field `{fname}` cannot be a nested object literal in this version"));
+                    }
+                    let field_ty = check_expr(value, env, fns, classes, generics, insts)?;
+                    if field_ty != *fty {
+                        return Err(format!("object literal does not match interface {iname}: field `{fname}` has type {field_ty:?} but the interface requires {fty:?}"));
+                    }
+                }
+                _ => return Err("object literal supports key-value fields only in this version (no shorthand, method, getter, or setter properties)".into()),
+            },
+            None => return Err("internal error: object literal field out of range".into()),
+        }
+    }
+    Ok(Ty::Interface(iname))
+}
+fn float_result(a: Ty, b: Ty) -> Ty { if matches!(a, Ty::F32 | Ty::F64) || matches!(b, Ty::F32 | Ty::F64) { Ty::F64 } else if a == Ty::F32 && b == Ty::F32 { Ty::F32 } else { Ty::Number } }
 fn required_type(ann: Option<&swc_ecma_ast::TsTypeAnn>, what: &str) -> Result<Ty, String> { type_annotation(ann)?.ok_or_else(|| format!("Nexa requires a concrete type for {what}; implicit any cannot enter native code")) }
 
 static GLOBAL_ENV: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Ty>>> = std::sync::LazyLock::new(Default::default);
@@ -81,22 +192,23 @@ fn walk_idents(e: &SExpr, out: &mut Vec<String>) {
         SExpr::Assign(a) => { if let swc_ecma_ast::AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Ident(i)) = &a.left { out.push(i.id.sym.to_string()); } walk_idents(&a.right, out); }
         SExpr::Call(c) => { if let Callee::Expr(x) = &c.callee { walk_idents(x, out); } for a in &c.args { walk_idents(&a.expr, out); } }
         SExpr::New(n) => { if let Some(args) = &n.args { for a in args { walk_idents(&a.expr, out); } } }
+        SExpr::Object(o) => for prop in &o.props { if let PropOrSpread::Prop(p) = prop { if let Prop::KeyValue(kv) = &**p { walk_idents(&kv.value, out); } } }
         _ => {}
     }
 }
 fn check_expr(e: &SExpr, env: &mut HashMap<String, Ty>, fns: &mut HashMap<String, FnSig>, classes: &mut HashMap<String, ClassDef>, generics: &HashMap<String, GenSig>, insts: &mut Vec<(String, Ty)>) -> Result<Ty, String> {
     match e {
-        SExpr::Lit(Lit::Num(_)) => Ok(Ty::Number), SExpr::Lit(Lit::Bool(_)) => Ok(Ty::Boolean), SExpr::Lit(Lit::Str(_)) => Ok(Ty::String),
+        SExpr::Lit(Lit::Num(n)) => Ok(if (n.raw.as_deref().map_or(false, |r| r.contains('.') || r.contains('e') || r.contains('E'))) || n.value.fract() != 0.0 { Ty::F64 } else { Ty::Number }), SExpr::Lit(Lit::Bool(_)) => Ok(Ty::Boolean), SExpr::Lit(Lit::Str(_)) => Ok(Ty::String),
         SExpr::Lit(_) => Err("Nexa supports only number, boolean, and string literals".into()),
         SExpr::Ident(i) => env.get(i.sym.as_ref()).copied().or_else(|| GLOBAL_ENV.lock().ok().and_then(|c| c.get(i.sym.as_ref()).copied())).ok_or_else(|| format!("unknown variable {}", i.sym)),
         SExpr::This(_) => env.get("this").copied().ok_or_else(|| "this used outside of class context".into()),
         SExpr::Paren(p) => check_expr(&p.expr, env, fns, classes, generics, insts), SExpr::TsAs(a) => check_expr(&a.expr, env, fns, classes, generics, insts), SExpr::TsNonNull(n) => check_expr(&n.expr, env, fns, classes, generics, insts),
-        SExpr::Unary(u) => { let t = check_expr(&u.arg, env, fns, classes, generics, insts)?; match u.op { swc_ecma_ast::UnaryOp::Bang => { if t != Ty::Boolean && t != Ty::Any { return Err("! expects boolean".into()); } Ok(Ty::Boolean) }, swc_ecma_ast::UnaryOp::Minus | swc_ecma_ast::UnaryOp::Plus => { if t != Ty::Number && t != Ty::Any { return Err("numeric unary operator expects number".into()); } Ok(Ty::Number) }, _ => Err("unsupported unary operator in Nexa".into()) } }
-        SExpr::Bin(b) => { let l = check_expr(&b.left, env, fns, classes, generics, insts)?; let r = check_expr(&b.right, env, fns, classes, generics, insts)?; match b.op { BinaryOp::Add => { if l == Ty::String && r == Ty::String { Ok(Ty::String) } else if compatible(Ty::Number, l) && compatible(Ty::Number, r) { Ok(Ty::Number) } else { Err("+ expects two numbers or two strings".into()) } }, BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => { if !compatible(Ty::Number, l) || !compatible(Ty::Number, r) { return Err("arithmetic operators expect numbers".into()); } Ok(Ty::Number) }, BinaryOp::LogicalAnd | BinaryOp::LogicalOr => { if !compatible(Ty::Boolean, l) || !compatible(Ty::Boolean, r) { return Err("logical operators expect booleans".into()); } Ok(Ty::Boolean) }, BinaryOp::EqEq | BinaryOp::NotEq | BinaryOp::EqEqEq | BinaryOp::NotEqEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => { if l != Ty::Any && r != Ty::Any && l != r { return Err("comparison operands must have compatible types".into()); } Ok(Ty::Boolean) }, _ => Err("unsupported binary operator in Nexa".into()) } }
+        SExpr::Unary(u) => { let t = check_expr(&u.arg, env, fns, classes, generics, insts)?; match u.op { swc_ecma_ast::UnaryOp::Bang => { if t != Ty::Boolean && t != Ty::Any { return Err("! expects boolean".into()); } Ok(Ty::Boolean) }, swc_ecma_ast::UnaryOp::Minus | swc_ecma_ast::UnaryOp::Plus => { if !(numeric(t) || t == Ty::Any) { return Err("numeric unary operator expects number, f32, or f64".into()); } Ok(t) }, _ => Err("unsupported unary operator in Nexa".into()) } }
+        SExpr::Bin(b) => { let l = check_expr(&b.left, env, fns, classes, generics, insts)?; let r = check_expr(&b.right, env, fns, classes, generics, insts)?; match b.op { BinaryOp::Add => { if l == Ty::String && r == Ty::String { Ok(Ty::String) } else if numeric(l) && numeric(r) { Ok(float_result(l, r)) } else { Err("+ expects two numbers, two strings, or two floats".into()) } }, BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => { if !numeric(l) || !numeric(r) { return Err("arithmetic operators expect number, f32, or f64 operands".into()); } Ok(float_result(l, r)) }, BinaryOp::Mod => { if !numeric(l) || !numeric(r) { return Err("modulo expects number operands".into()); } if is_float(l) || is_float(r) { return Err("modulo (%) is not supported on float operands".into()); } Ok(Ty::Number) }, BinaryOp::LogicalAnd | BinaryOp::LogicalOr => { if !compatible(Ty::Boolean, l) || !compatible(Ty::Boolean, r) { return Err("logical operators expect booleans".into()); } Ok(Ty::Boolean) }, BinaryOp::EqEq | BinaryOp::NotEq | BinaryOp::EqEqEq | BinaryOp::NotEqEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => { if l != Ty::Any && r != Ty::Any && l != r && !(numeric(l) && numeric(r)) { return Err("comparison operands must have compatible types".into()); } Ok(Ty::Boolean) }, _ => Err("unsupported binary operator in Nexa".into()) } }
         SExpr::Array(a) => { if a.elems.is_empty() { return Err("unsized array literal `[]` is a compile error in this version; use `new Array<number>(n)` to allocate an explicit size".into()); } for el in &a.elems { let Some(e) = el else { return Err("array literals may not contain holes or spread elements".into()); }; if e.spread.is_some() { return Err("spread (...) is not supported in array literals".into()); } let t = check_expr(&e.expr, env, fns, classes, generics, insts)?; if !compatible(Ty::Number, t) { return Err("number[] literal elements must all be numbers".into()); } } Ok(Ty::NumberArray) }
-        SExpr::Member(m) => { let object = check_expr(&m.obj, env, fns, classes, generics, insts)?; match &m.prop { MemberProp::Computed(c) => { if object != Ty::NumberArray && object != Ty::Any { return Err("indexed access requires a number[]".into()); } if !compatible(Ty::Number, check_expr(&c.expr, env, fns, classes, generics, insts)?) { return Err("array index must be a number".into()); } Ok(Ty::Number) },         MemberProp::Ident(field_ident) => { let field_name = field_ident.sym.to_string(); if object == Ty::NumberArray { if field_name == "length" { return Ok(Ty::Number); } return Ok(Ty::Number); } if let Ty::Class(cls_name) = object { let cls = classes.get(cls_name).ok_or_else(|| format!("unknown class {cls_name}"))?; for (name, ty) in &cls.fields { if name == &field_name { return Ok(ir_to_ty(*ty)); } } return Err(format!("unknown field {field_name} on class {cls_name}")); } if object == Ty::Any { return Ok(Ty::Any); } Err("field access on non-class type".into()) }, _ => Err("unsupported member property".into()) } }
-        SExpr::Assign(a) => { let new = check_expr(&a.right, env, fns, classes, generics, insts)?; match &a.left { swc_ecma_ast::AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Ident(i)) => { let name = i.id.sym.to_string(); let old = env.get(&name).copied().or_else(|| GLOBAL_ENV.lock().ok().and_then(|c| c.get(&name).copied())).ok_or_else(|| format!("unknown variable {name}"))?; if a.op != AssignOp::Assign && old != Ty::Number { return Err("compound assignment requires number".into()); } if !compatible(old, new) { return Err(format!("cannot assign {new:?} to {old:?}")); } Ok(old) }, swc_ecma_ast::AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Member(m)) => { if a.op != AssignOp::Assign { return Err("compound array assignment is not implemented".into()); } let object = check_expr(&m.obj, env, fns, classes, generics, insts)?; match object { Ty::NumberArray | Ty::Any => { if let MemberProp::Computed(c) = &m.prop { if !compatible(Ty::Number, check_expr(&c.expr, env, fns, classes, generics, insts)?) { return Err("array index must be a number".into()); } } if !compatible(Ty::Number, new) { return Err("number[] elements must be numbers".into()); } Ok(Ty::Number) }, Ty::Class(cls_name) => { let cls = classes.get(cls_name).ok_or_else(|| format!("unknown class {cls_name}"))?; if let MemberProp::Ident(field_ident) = &m.prop { let field_name = field_ident.sym.to_string(); for (name, ty) in &cls.fields { if name == &field_name { if !compatible(ir_to_ty(*ty), new) { return Err(format!("cannot assign {new:?} to field {field_name} of type {:?}", ir_to_ty(*ty))); } return Ok(new); } } return Err(format!("unknown field {field_name} on class {cls_name}")); } Err("field assignment requires an identifier".into()) }, _ => Err("indexed assignment requires a number[]".into()) } }, _ => Err("Nexa assignments require a local identifier or array element".into()) } }
-        SExpr::Call(c) => { let name = match &c.callee { Callee::Expr(x) => match &**x { SExpr::Ident(i) => i.sym.to_string(), SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Ident(i) if i.sym == "console") && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "log") => "console.log".into(),                 SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Ident(i) if i.sym == "std") && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "log" || i.sym == "in" || i.sym == "parseNumber" || i.sym == "toCString" || i.sym == "fromCString" || i.sym == "funcPtr" || i.sym == "strlen" || i.sym == "charAt") => { let MemberProp::Ident(pi) = &m.prop else { unreachable!() }; format!("std.{}", pi.sym) }, SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Member(inner) if matches!(&inner.obj.as_ref(), SExpr::Ident(i) if i.sym == "std") && matches!(&inner.prop, MemberProp::Ident(i) if i.sym == "net")) && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "sockaddrIn" || i.sym == "socket" || i.sym == "bind" || i.sym == "listen" || i.sym == "accept" || i.sym == "recv" || i.sym == "send" || i.sym == "close") => { let MemberProp::Ident(pi) = &m.prop else { unreachable!() }; format!("std.net.{}", pi.sym) }, SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Member(inner) if matches!(&inner.obj.as_ref(), SExpr::Ident(i) if i.sym == "std") && matches!(&inner.prop, MemberProp::Ident(i) if i.sym == "process")) && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "fork" || i.sym == "exec1" || i.sym == "exec2" || i.sym == "pipe" || i.sym == "pipeReadFd" || i.sym == "pipeWriteFd" || i.sym == "wait" || i.sym == "exit") => { let MemberProp::Ident(pi) = &m.prop else { unreachable!() }; format!("std.process.{}", pi.sym) }, SExpr::Member(m) => { if let MemberProp::Ident(method_ident) = &m.prop { let method_name = method_ident.sym.to_string(); let obj_ty = check_expr(&m.obj, env, fns, classes, generics, insts)?; if let Ty::Class(cls_name) = obj_ty { let sig_name = format!("{}.{}", cls_name, method_name); let sig = fns.get(&sig_name).ok_or_else(|| format!("unknown method {}.{}", cls_name, method_name))?.clone(); if sig.params.len() - 1 != c.args.len() { return Err(format!("method {} expects {} arguments", sig_name, sig.params.len() - 1)); } for (p, a) in sig.params.iter().skip(1).zip(&c.args) { let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(*p, t) { return Err(format!("argument type {t:?} does not match {p:?}")); } } return Ok(sig.ret); } } return Err("cannot call method on non-class type".into()); } _ => return Err("Nexa calls require a named function".into()) }, _ => return Err("unsupported call target".into()) }; let name = if name == "console.log" { "std.log".to_string() } else { name };
+        SExpr::Member(m) => { let object = check_expr(&m.obj, env, fns, classes, generics, insts)?; match &m.prop { MemberProp::Computed(c) => { let elem = match object { Ty::Float32Array => Ty::F32, Ty::Float64Array => Ty::F64, _ => Ty::Number }; if object != Ty::NumberArray && object != Ty::Float32Array && object != Ty::Float64Array && object != Ty::Any { return Err("indexed access requires a number[], f32[], or f64[] array".into()); } let idx = check_expr(&c.expr, env, fns, classes, generics, insts)?; if !(compatible(Ty::Number, idx) || idx == Ty::Any) { return Err("array index must be a number".into()); } Ok(elem) },         MemberProp::Ident(field_ident) => { let field_name = field_ident.sym.to_string(); if matches!(object, Ty::NumberArray | Ty::Float32Array | Ty::Float64Array) { if field_name == "length" { return Ok(Ty::Number); } return Err(format!("arrays have only a `length` property, not `{field_name}`")); } if let Ty::Class(cls_name) = object { let cls = classes.get(cls_name).ok_or_else(|| format!("unknown class {cls_name}"))?; for (name, ty) in &cls.fields { if name == &field_name { return Ok(ir_to_ty(*ty)); } } return Err(format!("unknown field {field_name} on class {cls_name}")); } if let Ty::Interface(iname) = object { let fields = ACTIVE_INTERFACES.with(|c| c.borrow().get(iname).cloned()).unwrap_or_default(); for (name, ty) in &fields { if name == &field_name { return Ok(*ty); } } return Err(format!("unknown field {field_name} on interface {iname}")); } if object == Ty::Any { return Ok(Ty::Any); } Err("field access on non-class type".into()) }, _ => Err("unsupported member property".into()) } }
+        SExpr::Assign(a) => { let new = check_expr(&a.right, env, fns, classes, generics, insts)?; match &a.left { swc_ecma_ast::AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Ident(i)) => { let name = i.id.sym.to_string(); let old = env.get(&name).copied().or_else(|| GLOBAL_ENV.lock().ok().and_then(|c| c.get(&name).copied())).ok_or_else(|| format!("unknown variable {name}"))?; if a.op != AssignOp::Assign && old != Ty::Number { return Err("compound assignment requires number".into()); } if !assignable(old, new, classes)? { return Err(format!("cannot assign {new:?} to {old:?}")); } Ok(old) }, swc_ecma_ast::AssignTarget::Simple(swc_ecma_ast::SimpleAssignTarget::Member(m)) => { if a.op != AssignOp::Assign { return Err("compound array assignment is not implemented".into()); } let object = check_expr(&m.obj, env, fns, classes, generics, insts)?; match object { Ty::NumberArray | Ty::Float32Array | Ty::Float64Array | Ty::Any => { let elem = match object { Ty::Float32Array => Ty::F32, Ty::Float64Array => Ty::F64, _ => Ty::Number }; if let MemberProp::Computed(c) = &m.prop { if !compatible(Ty::Number, check_expr(&c.expr, env, fns, classes, generics, insts)?) { return Err("array index must be a number".into()); } } if !assignable(elem, new, classes)? { return Err(format!("cannot assign {new:?} to an array of {elem:?}")); } Ok(new) }, Ty::Class(cls_name) => { let cls = classes.get(cls_name).ok_or_else(|| format!("unknown class {cls_name}"))?; if let MemberProp::Ident(field_ident) = &m.prop { let field_name = field_ident.sym.to_string(); for (name, ty) in &cls.fields { if name == &field_name { if !assignable(ir_to_ty(*ty), new, classes)? { return Err(format!("cannot assign {new:?} to field {field_name} of type {:?}", ir_to_ty(*ty))); } return Ok(new); } } return Err(format!("unknown field {field_name} on class {cls_name}")); } Err("field assignment requires an identifier".into()) }, Ty::Interface(iname) => { let fields = ACTIVE_INTERFACES.with(|c| c.borrow().get(iname).cloned()).unwrap_or_default(); if let MemberProp::Ident(field_ident) = &m.prop { let field_name = field_ident.sym.to_string(); for (name, ty) in &fields { if name == &field_name { if !assignable(*ty, new, classes)? { return Err(format!("cannot assign {new:?} to field {field_name} of type {ty:?}")); } return Ok(new); } } return Err(format!("unknown field {field_name} on interface {iname}")); } Err("field assignment requires an identifier".into()) }, _ => Err("indexed assignment requires an array (number[], f32[], or f64[])".into()) } }, _ => Err("Nexa assignments require a local identifier or array element".into()) } }
+        SExpr::Call(c) => { let name = match &c.callee { Callee::Expr(x) => match &**x { SExpr::Ident(i) => i.sym.to_string(), SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Ident(i) if i.sym == "console") && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "log") => "console.log".into(),                 SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Ident(i) if i.sym == "std") && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "log" || i.sym == "in" || i.sym == "parseNumber" || i.sym == "toCString" || i.sym == "fromCString" || i.sym == "funcPtr" || i.sym == "strlen" || i.sym == "charAt" || i.sym == "toF64" || i.sym == "toF32" || i.sym == "toInt") => { let MemberProp::Ident(pi) = &m.prop else { unreachable!() }; format!("std.{}", pi.sym) }, SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Member(inner) if matches!(&inner.obj.as_ref(), SExpr::Ident(i) if i.sym == "std") && matches!(&inner.prop, MemberProp::Ident(i) if i.sym == "net")) && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "sockaddrIn" || i.sym == "socket" || i.sym == "bind" || i.sym == "listen" || i.sym == "accept" || i.sym == "recv" || i.sym == "send" || i.sym == "close") => { let MemberProp::Ident(pi) = &m.prop else { unreachable!() }; format!("std.net.{}", pi.sym) }, SExpr::Member(m) if matches!(&m.obj.as_ref(), SExpr::Member(inner) if matches!(&inner.obj.as_ref(), SExpr::Ident(i) if i.sym == "std") && matches!(&inner.prop, MemberProp::Ident(i) if i.sym == "process")) && matches!(&m.prop, MemberProp::Ident(i) if i.sym == "fork" || i.sym == "exec1" || i.sym == "exec2" || i.sym == "pipe" || i.sym == "pipeReadFd" || i.sym == "pipeWriteFd" || i.sym == "wait" || i.sym == "exit") => { let MemberProp::Ident(pi) = &m.prop else { unreachable!() }; format!("std.process.{}", pi.sym) }, SExpr::Member(m) => { if let MemberProp::Ident(method_ident) = &m.prop { let method_name = method_ident.sym.to_string(); let obj_ty = check_expr(&m.obj, env, fns, classes, generics, insts)?; if let Ty::Class(cls_name) = obj_ty { let sig_name = format!("{}.{}", cls_name, method_name); let sig = fns.get(&sig_name).ok_or_else(|| format!("unknown method {}.{}", cls_name, method_name))?.clone(); if sig.params.len() - 1 != c.args.len() { return Err(format!("method {} expects {} arguments", sig_name, sig.params.len() - 1)); } for (p, a) in sig.params.iter().skip(1).zip(&c.args) { let t = if let SExpr::Object(obj) = &*a.expr { check_object_literal(obj, *p, env, fns, classes, generics, insts)? } else { check_expr(&a.expr, env, fns, classes, generics, insts)? }; if !assignable(*p, t, classes)? { return Err(format!("argument type {t:?} does not match {p:?}")); } } return Ok(sig.ret); } } return Err("cannot call method on non-class type".into()); } _ => return Err("Nexa calls require a named function".into()) }, _ => return Err("unsupported call target".into()) }; let name = if name == "console.log" { "std.log".to_string() } else { name };
         if let Some(op) = stdlib::StdOp::of(&name) {
             let arg_types;
             let func_ptr_literal;
@@ -111,8 +223,8 @@ fn check_expr(e: &SExpr, env: &mut HashMap<String, Ty>, fns: &mut HashMap<String
                 });
             }
             return stdlib::check_call(op, c.args.len(), &arg_types, func_ptr_literal.as_deref(), env, fns);
-        } if c.type_args.is_some() && !generics.contains_key(&name) { return Err(format!("type arguments are only allowed when calling generic functions; {name} is not generic")); } if let Some(sig) = generics.get(&name) { let Some(targs) = c.type_args.as_deref().map(|t| t.params.as_slice()) else { return Err(format!("generic function {name} requires an explicit type instantiation at every call site, e.g. {name}<number>(...)")); }; if targs.len() != 1 { return Err("Nexa supports only a single type argument per generic call".into()); } let ty = resolve_type_arg(&targs[0])?; if matches!(ty, Ty::Void | Ty::Any) { return Err(format!("cannot instantiate {name} with void or any")); } let subst = |g: &GTy| match g { GTy::Concrete(t) => *t, GTy::Param => ty }; if sig.params.len() != c.args.len() { return Err(format!("function {name} expects {} arguments", sig.params.len())); } for (p, a) in sig.params.iter().zip(&c.args) { let expected = subst(p); let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(expected, t) { return Err(format!("argument type {t:?} does not match {expected:?}")); } } insts.push((name.clone(), ty)); return Ok(subst(&sig.ret)); } if env.get(&name) == Some(&Ty::ClosureNumber) { if !c.args.is_empty() { return Err("Nexa v1 closures take no arguments".into()); } return Ok(Ty::Number); } let sig = fns.get(&name).ok_or_else(|| format!("unknown function {name}"))?.clone(); if sig.params.len() != c.args.len() { return Err(format!("function {name} expects {} arguments", sig.params.len())); } for (p, a) in sig.params.iter().zip(&c.args) { let t = check_expr(&a.expr, env, fns, classes, generics, insts)?; if !compatible(*p, t) { return Err(format!("argument type {t:?} does not match {p:?}")); } } Ok(sig.ret) }
-        SExpr::New(n) => { if let SExpr::Ident(class_ident) = &*n.callee { let class_name = class_ident.sym.to_string(); if class_name == "Array" { if n.args.as_deref().map_or(true, |a| a.is_empty()) || n.args.as_deref().unwrap().len() != 1 { return Err("new Array<number>(n) requires exactly one size argument".into()); } if !compatible(Ty::Number, check_expr(&n.args.as_deref().unwrap()[0].expr, env, fns, classes, generics, insts)?) { return Err("array size must be a number".into()); } return Ok(Ty::NumberArray); } let cls = classes.get(&class_name).ok_or_else(|| format!("unknown class {class_name}"))?; let ctor_name = &cls.constructor_name; let sig = fns.get(ctor_name).ok_or_else(|| format!("unknown constructor {ctor_name}"))?; if sig.params.len() != n.args.as_deref().unwrap_or(&[]).len() + 1 { return Err(format!("constructor {} expects {} arguments (including implicit this)", ctor_name, sig.params.len())); } Ok(Ty::Class(leak_str(&class_name))) } else { Err("new requires a class name".into()) } }
+        } if c.type_args.is_some() && !generics.contains_key(&name) { return Err(format!("type arguments are only allowed when calling generic functions; {name} is not generic")); } if let Some(sig) = generics.get(&name) { let Some(targs) = c.type_args.as_deref().map(|t| t.params.as_slice()) else { return Err(format!("generic function {name} requires an explicit type instantiation at every call site, e.g. {name}<number>(...)")); }; if targs.len() != 1 { return Err("Nexa supports only a single type argument per generic call".into()); } let ty = resolve_type_arg(&targs[0])?; if matches!(ty, Ty::Void | Ty::Any) { return Err(format!("cannot instantiate {name} with void or any")); } let subst = |g: &GTy| match g { GTy::Concrete(t) => *t, GTy::Param => ty }; if sig.params.len() != c.args.len() { return Err(format!("function {name} expects {} arguments", sig.params.len())); } for (p, a) in sig.params.iter().zip(&c.args) { let expected = subst(p); let t = if let SExpr::Object(obj) = &*a.expr { check_object_literal(obj, expected, env, fns, classes, generics, insts)? } else { check_expr(&a.expr, env, fns, classes, generics, insts)? }; if !assignable(expected, t, classes)? { return Err(format!("argument type {t:?} does not match {expected:?}")); } } insts.push((name.clone(), ty)); return Ok(subst(&sig.ret)); } if env.get(&name) == Some(&Ty::ClosureNumber) { if !c.args.is_empty() { return Err("Nexa v1 closures take no arguments".into()); } return Ok(Ty::Number); } let sig = fns.get(&name).ok_or_else(|| format!("unknown function {name}"))?.clone(); if sig.params.len() != c.args.len() { return Err(format!("function {name} expects {} arguments", sig.params.len())); } for (p, a) in sig.params.iter().zip(&c.args) { let t = if let SExpr::Object(obj) = &*a.expr { check_object_literal(obj, *p, env, fns, classes, generics, insts)? } else { check_expr(&a.expr, env, fns, classes, generics, insts)? }; if !assignable(*p, t, classes)? { return Err(format!("argument type {t:?} does not match {p:?}")); } } Ok(sig.ret) }
+        SExpr::New(n) => { if let SExpr::Ident(class_ident) = &*n.callee { let class_name = class_ident.sym.to_string(); if class_name == "Array" { if n.args.as_deref().map_or(true, |a| a.is_empty()) || n.args.as_deref().unwrap().len() != 1 { return Err("new Array<T>(n) requires exactly one size argument".into()); } if !compatible(Ty::Number, check_expr(&n.args.as_deref().unwrap()[0].expr, env, fns, classes, generics, insts)?) { return Err("array size must be a number".into()); } let elem = n.type_args.as_deref().and_then(|t| t.params.first()).map(|t| resolve_type_arg(t)).transpose()?.unwrap_or(Ty::Number); if !matches!(elem, Ty::Number | Ty::F32 | Ty::F64) { return Err("new Array requires a number, f32, or f64 element type".into()); } return Ok(match elem { Ty::F32 => Ty::Float32Array, Ty::F64 => Ty::Float64Array, _ => Ty::NumberArray }); } let cls = classes.get(&class_name).ok_or_else(|| format!("unknown class {class_name}"))?; let ctor_name = &cls.constructor_name; let sig = fns.get(ctor_name).ok_or_else(|| format!("unknown constructor {ctor_name}"))?; if sig.params.len() != n.args.as_deref().unwrap_or(&[]).len() + 1 { return Err(format!("constructor {} expects {} arguments (including implicit this)", ctor_name, sig.params.len())); } Ok(Ty::Class(leak_str(&class_name))) } else { Err("new requires a class name".into()) } }
         SExpr::Arrow(a) => {
             if !a.params.is_empty() { return Err("Nexa v1 closures take no arguments".into()); }
             if a.type_params.is_some() { return Err("generic closures are not supported; use a generic function declaration".into()); }
@@ -123,12 +235,13 @@ fn check_expr(e: &SExpr, env: &mut HashMap<String, Ty>, fns: &mut HashMap<String
             }
             Ok(Ty::ClosureNumber)
         }
+        SExpr::Object(_) => Err("object literals are supported only where a named interface type is expected in this version (as a function argument or the initializer of an explicitly-typed `let`)".into()),
         _ => Err("unsupported expression in Nexa type checker".into()),
     }
 }
 fn check_stmt(s: &SStmt, env: &mut HashMap<String, Ty>, fns: &mut HashMap<String, FnSig>, classes: &mut HashMap<String, ClassDef>, ret: Ty, generics: &HashMap<String, GenSig>, insts: &mut Vec<(String, Ty)>) -> Result<(), String> {
     match s {
-        SStmt::Decl(Decl::Var(v)) => for d in &v.decls { let Pat::Ident(i) = &d.name else { return Err("Nexa local declarations require identifiers".into()); }; let actual = d.init.as_ref().map(|x| check_expr(x, env, fns, classes, generics, insts)).transpose()?.unwrap_or(Ty::Any); if actual == Ty::Any { return Err(format!("Nexa requires an initializer or concrete annotation for {}", i.id.sym)); } let declared = type_annotation(i.type_ann.as_deref())?.unwrap_or(actual); if !compatible(declared, actual) { return Err(format!("initializer type {actual:?} does not match {declared:?}")); } env.insert(i.id.sym.to_string(), declared); },
+        SStmt::Decl(Decl::Var(v)) => for d in &v.decls { let Pat::Ident(i) = &d.name else { return Err("Nexa local declarations require identifiers".into()); }; let actual = match d.init.as_ref() { Some(init) => { let declared_ann = type_annotation(i.type_ann.as_deref())?; if let SExpr::Object(obj) = &**init { let expected = declared_ann.ok_or_else(|| format!("object literal initializer for `{}` requires an explicit named interface annotation", i.id.sym))?; check_object_literal(obj, expected, env, fns, classes, generics, insts)? } else { check_expr(init, env, fns, classes, generics, insts)? } } None => Ty::Any }; if actual == Ty::Any { return Err(format!("Nexa requires an initializer or concrete annotation for {}", i.id.sym)); } let declared = type_annotation(i.type_ann.as_deref())?.unwrap_or(actual); if !assignable(declared, actual, classes)? { return Err(format!("initializer type {actual:?} does not match {declared:?}")); } env.insert(i.id.sym.to_string(), declared); },
         SStmt::Decl(Decl::Class(c)) => {
             let class_name = c.ident.sym.to_string();
             let mut fields = Vec::new();
@@ -188,11 +301,11 @@ fn check_stmt(s: &SStmt, env: &mut HashMap<String, Ty>, fns: &mut HashMap<String
             classes.insert(class_name.clone(), ClassDef { name: class_name, fields: fields.into_iter().map(|(n, t)| (n, ty_to_ir(t))).collect(), constructor_name, method_names });
         }
         SStmt::Expr(e) => { check_expr(&e.expr, env, fns, classes, generics, insts)?; },
-        SStmt::Return(r) => { let actual = r.arg.as_ref().map(|x| check_expr(x, env, fns, classes, generics, insts)).transpose()?.unwrap_or(Ty::Void); if !compatible(ret, actual) { return Err(format!("return type {actual:?} does not match {ret:?}")); } },
+        SStmt::Return(r) => { let actual = r.arg.as_ref().map(|x| check_expr(x, env, fns, classes, generics, insts)).transpose()?.unwrap_or(Ty::Void); if !assignable(ret, actual, classes)? { return Err(format!("return type {actual:?} does not match {ret:?}")); } },
         SStmt::Block(b) => for s in &b.stmts { check_stmt(s, env, fns, classes, ret, generics, insts)?; },
         SStmt::If(i) => { let t = check_expr(&i.test, env, fns, classes, generics, insts)?; if t != Ty::Boolean && t != Ty::Any { return Err("if condition must be boolean".into()); } check_stmt(&i.cons, env, fns, classes, ret, generics, insts)?; if let Some(a) = &i.alt { check_stmt(a, env, fns, classes, ret, generics, insts)?; } },
         SStmt::While(w) => { let t = check_expr(&w.test, env, fns, classes, generics, insts)?; if t != Ty::Boolean && t != Ty::Any { return Err("while condition must be boolean".into()); } check_stmt(&w.body, env, fns, classes, ret, generics, insts)?; },
-        SStmt::For(f) => { if let Some(init) = &f.init { match init { swc_ecma_ast::VarDeclOrExpr::VarDecl(v) => for d in &v.decls { let Pat::Ident(i) = &d.name else { return Err("Nexa for declarations require identifiers".into()); }; let actual = d.init.as_ref().map(|x| check_expr(x, env, fns, classes, generics, insts)).transpose()?.unwrap_or(Ty::Any); let declared = type_annotation(i.type_ann.as_deref())?.unwrap_or(actual); if !compatible(declared, actual) { return Err(format!("initializer type {actual:?} does not match {declared:?}")); } env.insert(i.id.sym.to_string(), declared); }, swc_ecma_ast::VarDeclOrExpr::Expr(e) => { check_expr(e, env, fns, classes, generics, insts)?; } } } if let Some(test) = &f.test { let t = check_expr(test, env, fns, classes, generics, insts)?; if t != Ty::Boolean && t != Ty::Any { return Err("for condition must be boolean".into()); } } if let Some(update) = &f.update { check_expr(update, env, fns, classes, generics, insts)?; } check_stmt(&f.body, env, fns, classes, ret, generics, insts)?; },
+        SStmt::For(f) => { if let Some(init) = &f.init { match init { swc_ecma_ast::VarDeclOrExpr::VarDecl(v) => for d in &v.decls { let Pat::Ident(i) = &d.name else { return Err("Nexa for declarations require identifiers".into()); }; let actual = match d.init.as_ref() { Some(init) => { let declared_ann = type_annotation(i.type_ann.as_deref())?; if let SExpr::Object(obj) = &**init { let expected = declared_ann.ok_or_else(|| format!("object literal initializer for `{}` requires an explicit named interface annotation", i.id.sym))?; check_object_literal(obj, expected, env, fns, classes, generics, insts)? } else { check_expr(init, env, fns, classes, generics, insts)? } } None => Ty::Any }; let declared = type_annotation(i.type_ann.as_deref())?.unwrap_or(actual); if !assignable(declared, actual, classes)? { return Err(format!("initializer type {actual:?} does not match {declared:?}")); } env.insert(i.id.sym.to_string(), declared); }, swc_ecma_ast::VarDeclOrExpr::Expr(e) => { check_expr(e, env, fns, classes, generics, insts)?; } } } if let Some(test) = &f.test { let t = check_expr(test, env, fns, classes, generics, insts)?; if t != Ty::Boolean && t != Ty::Any { return Err("for condition must be boolean".into()); } } if let Some(update) = &f.update { check_expr(update, env, fns, classes, generics, insts)?; } check_stmt(&f.body, env, fns, classes, ret, generics, insts)?; },
         SStmt::ForOf(f) => { let iter_ty = check_expr(&f.right, env, fns, classes, generics, insts)?; let elem_ty = match iter_ty { Ty::NumberArray => Ty::Number, Ty::String => Ty::String, _ => return Err(format!("cannot iterate over {iter_ty:?}; only number[] and string are iterable")) }; let bname = match &f.left { swc_ecma_ast::ForHead::VarDecl(v) if v.kind == swc_ecma_ast::VarDeclKind::Const => { if v.decls.len() != 1 { return Err("Nexa for...of requires a single identifier binder".into()); } match &v.decls[0].name { Pat::Ident(b) => b.id.sym.to_string(), _ => return Err("Nexa for...of requires a single identifier binder".into()) } }, _ => return Err("Nexa v1 for...of supports only a `const x of ...` declaration".into()) }; env.insert(bname, elem_ty); check_stmt(&f.body, env, fns, classes, ret, generics, insts)?; },
         SStmt::Empty(_) => {},
         _ => return Err("unsupported statement in Nexa type checker".into()),
@@ -212,6 +325,7 @@ pub(crate) fn check_module_with_externs(module: &SwcModule, externs: &HashMap<St
     let mut globals: HashMap<String, Ty> = HashMap::new();
     let mut global_decls: Vec<(String, Ty, swc_ecma_ast::Expr)> = Vec::new();
     let mut global_index: HashMap<String, usize> = HashMap::new();
+    ACTIVE_INTERFACES.with(|s| *s.borrow_mut() = HashMap::new());
     for item in &module.body {
         match item {
             ModuleItem::Stmt(SStmt::Decl(Decl::Fn(f))) => {
@@ -239,6 +353,9 @@ pub(crate) fn check_module_with_externs(module: &SwcModule, externs: &HashMap<St
             }
             ModuleItem::Stmt(SStmt::Decl(Decl::Class(c))) => {
                 let class_name = c.ident.sym.to_string();
+                if ACTIVE_INTERFACES.with(|s| s.borrow().contains_key(&class_name)) {
+                    return Err(format!("duplicate top-level declaration `{class_name}` (an interface of the same name already exists)"));
+                }
                 let mut fields = Vec::new();
                 let constructor_name = format!("{class_name}__constructor");
                 let mut method_names = Vec::new();
@@ -280,7 +397,52 @@ pub(crate) fn check_module_with_externs(module: &SwcModule, externs: &HashMap<St
                     }
                 }
             fns.entry(constructor_name.clone()).or_insert_with(|| FnSig { params: vec![Ty::Class(leak_str(&class_name))], ret: Ty::Void });
+                for impl_ in &c.class.implements {
+                    let TsExprWithTypeArgs { expr, type_args, .. } = impl_;
+                    let SExpr::Ident(iname) = &**expr else { return Err("`implements` must name a single interface".into()); };
+                    if type_args.is_some() { return Err("generic `implements` clauses are not supported".into()); }
+                    let iname = iname.sym.to_string();
+                    let ifields = ACTIVE_INTERFACES.with(|s| s.borrow().get(&iname).cloned()).ok_or_else(|| format!("unknown interface `{iname}` in implements clause of class `{class_name}` (interfaces must be declared before the classes that implement them)"))?;
+                    for (i, (if_name, if_ty)) in ifields.iter().enumerate() {
+                        let mismatch = match fields.get(i) {
+                            Some((fname, fty)) => fname != if_name || fty != if_ty,
+                            None => true,
+                        };
+                        if mismatch {
+                            return Err(format!("class {class_name} does not satisfy interface {iname}: interface field `{if_name}` must be declared at the same index ({i}) with the same type ({if_ty:?})"));
+                        }
+                    }
+                }
                 classes.insert(class_name.clone(), ClassDef { name: class_name, fields: fields.into_iter().map(|(n, t)| (n, ty_to_ir(t))).collect(), constructor_name, method_names });
+            }
+            ModuleItem::Stmt(SStmt::Decl(Decl::TsInterface(i))) => {
+                // Structural interfaces: field-shape types only. Collected in
+                // this first pass so that annotations (params, lets, returns,
+                // call sites) can resolve the name to an interface type.
+                let name = i.id.sym.to_string();
+                if fns.contains_key(&name) || classes.contains_key(&name) || ACTIVE_INTERFACES.with(|s| s.borrow().contains_key(&name)) {
+                    return Err(format!("duplicate top-level declaration `{name}`"));
+                }
+                if i.type_params.is_some() { return Err("generic interfaces are not supported in this version".into()); }
+                if !i.extends.is_empty() { return Err("interface-to-interface extension (`interface A extends B`) is not supported in this version".into()); }
+                let mut fields = Vec::new();
+                for elem in &i.body.body {
+                    match elem {
+                        TsTypeElement::TsPropertySignature(psig) => {
+                            if psig.computed { return Err(format!("interface `{name}`: computed property names are not supported")); }
+                            if psig.optional { return Err(format!("interface `{name}`: optional fields are not supported; every interface field is required")); }
+                            let SExpr::Ident(fn_ident) = psig.key.as_ref() else { return Err(format!("interface `{name}`: fields must be simple identifiers")); };
+                            let field_name = fn_ident.sym.to_string();
+                            let field_ty = required_type(psig.type_ann.as_deref(), &format!("interface {name}.{field_name}"))?;
+                            if !matches!(field_ty, Ty::Number | Ty::Boolean | Ty::String | Ty::Pointer) {
+                                return Err(format!("interface `{name}` field `{field_name}` must be number, boolean, string, or Pointer; got {field_ty:?}"));
+                            }
+                            fields.push((field_name.clone(), field_ty));
+                        }
+                        _ => return Err(format!("interface `{name}` supports fields only in this version (no method, index, getter, setter, or call signatures)")),
+                    }
+                }
+                ACTIVE_INTERFACES.with(|s| { s.borrow_mut().insert(name, fields); });
             }
             ModuleItem::Stmt(SStmt::Decl(Decl::Var(v))) => {
                 if v.decls.len() != 1 { return Err("Nexa supports only single-declarator top-level global declarations".into()); }
@@ -288,7 +450,7 @@ pub(crate) fn check_module_with_externs(module: &SwcModule, externs: &HashMap<St
                 let name = p.id.sym.to_string();
                 if globals.contains_key(&name) || fns.contains_key(&name) || classes.contains_key(&name) { return Err(format!("duplicate top-level declaration `{name}`")); }
                 let ty = required_type(p.type_ann.as_deref(), "module next to global")?;
-                if !matches!(ty, Ty::Number | Ty::Boolean | Ty::String) { return Err(format!("top-level global `{name}` must be number, boolean, or string; got {ty:?}")); }
+                if !matches!(ty, Ty::Number | Ty::Boolean | Ty::String | Ty::F32 | Ty::F64) { return Err(format!("top-level global `{name}` must be number, boolean, string, f32, or f64; got {ty:?}")); }
                 let init = v.decls[0].init.as_deref().ok_or_else(|| format!("top-level global `{name}` requires an initializer"))?.clone();
                 global_index.insert(name.clone(), global_decls.len());
                 global_decls.push((name.clone(), ty, init));
@@ -310,7 +472,7 @@ pub(crate) fn check_module_with_externs(module: &SwcModule, externs: &HashMap<St
         }
         GLOBAL_ENV.lock().unwrap().clone_from(&declared);
         let init_ty = check_expr(init, &mut HashMap::new(), &mut fns, &mut classes, &generics, &mut insts)?;
-        if !compatible(*ty, init_ty) { return Err(format!("initializer type {init_ty:?} for global `{name}` does not match declared type {ty:?}")); }
+        if !assignable(*ty, init_ty, &classes)? { return Err(format!("initializer type {init_ty:?} for global `{name}` does not match declared type {ty:?}")); }
         declared.insert(name.clone(), *ty);
     }
     GLOBAL_ENV.lock().unwrap().clone_from(&globals);
@@ -400,5 +562,6 @@ pub(crate) fn check_module_with_externs(module: &SwcModule, externs: &HashMap<St
         body_result?;
     }
     GLOBAL_ENV.lock().unwrap().clear();
+    ACTIVE_INTERFACES.with(|s| *s.borrow_mut() = HashMap::new());
     Ok(())
 }

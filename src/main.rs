@@ -86,6 +86,8 @@ fn extern_scalar_ty(name: &str, ret: bool) -> Result<Ty, String> {
     match name {
         "number" => Ok(Ty::Number),
         "boolean" => Ok(Ty::Boolean),
+        "f32" => Ok(Ty::F32),
+        "f64" => Ok(Ty::F64),
         "Pointer" => Ok(Ty::Pointer),
         "void" if ret => Ok(Ty::Void),
         // Any other bare identifier is a fixed-layout class/struct type. A class
@@ -183,7 +185,7 @@ fn blank_unsafe_markers(source: &str) -> Result<String, String> {
 
 #[derive(Clone, Debug)]
 pub(crate) enum Expr {
-    Num(i64), Bool(bool), Str(Vec<u8>), Array(Vec<Expr>),
+    Num(i64), FNum(f64), Bool(bool), Str(Vec<u8>), Array(Vec<Expr>),
     Index(Box<Expr>, Box<Expr>),
     Var(String),
     FieldAccess(Box<Expr>, String),
@@ -194,6 +196,11 @@ pub(crate) enum Expr {
     Call(String, Vec<Expr>),
     CallGeneric(String, ir::IrType, Vec<Expr>),
     Closure(Vec<Stmt>),
+    // Object literal. `String` is the synthesized per-site layout name (a
+    // struct registered in the compiler under a unique `__objlit_n`), followed
+    // by the literal's fields in declaration order with their value exprs.
+    // Every literal site gets its own layout.
+    ObjectLiteral(String, Vec<(String, Expr)>),
 }
 #[derive(Clone, Debug)]
 pub(crate) enum Stmt {
@@ -226,6 +233,11 @@ pub(crate) struct ClassDecl {
     pub(crate) methods: Vec<Fun>,
 }
 #[derive(Clone, Debug)]
+pub(crate) struct InterfaceDecl {
+    pub(crate) name: String,
+    pub(crate) fields: Vec<(String, ir::IrType)>,
+}
+#[derive(Clone, Debug)]
 pub(crate) struct GlobalDecl {
     pub(crate) name: String,
     pub(crate) ty: ir::IrType,
@@ -245,26 +257,61 @@ fn inject_global_init(functions: &mut Vec<Fun>, globals: &[GlobalDecl]) {
     }
 }
 
-fn ty_tag(ty: ir::IrType) -> String { match ty { ir::IrType::Number => "number".into(), ir::IrType::Boolean => "boolean".into(), ir::IrType::String => "string".into(), ir::IrType::Pointer => "Pointer".into(), ir::IrType::NumberArray => "numberArray".into(), ir::IrType::ClosureNumber => "closureNumber".into(), ir::IrType::Void => "void".into(), ir::IrType::Any => "any".into(), ir::IrType::TParam => "TParam".into(), ir::IrType::Class(name) => format!("class.{name}") } }
+fn ty_tag(ty: ir::IrType) -> String { match ty { ir::IrType::Number => "number".into(), ir::IrType::Boolean => "boolean".into(), ir::IrType::String => "string".into(), ir::IrType::Pointer => "Pointer".into(), ir::IrType::NumberArray => "numberArray".into(), ir::IrType::Float32Array => "f32Array".into(), ir::IrType::Float64Array => "f64Array".into(), ir::IrType::F32 => "f32".into(), ir::IrType::F64 => "f64".into(), ir::IrType::ClosureNumber => "closureNumber".into(), ir::IrType::Void => "void".into(), ir::IrType::Any => "any".into(), ir::IrType::TParam => "TParam".into(), ir::IrType::Class(name) => format!("class.{name}") } }
 
 fn main() { if let Err(e) = run() { eprintln!("nexa: {e}"); std::process::exit(1); } }
 fn strip_top_level_entry_call(source: &str) -> String { source.lines().filter(|line| line.trim() != "main();").collect::<Vec<_>>().join("\n") }
 
-fn parse_nexa(source: &str) -> Result<(Vec<ClassDecl>, Vec<Fun>, Vec<GlobalDecl>), String> {
+fn parse_nexa(source: &str) -> Result<(Vec<ClassDecl>, Vec<InterfaceDecl>, Vec<Fun>, Vec<GlobalDecl>), String> {
     let (externs, clean) = extract_extern_blocks(source)?;
     parse_nexa_with_externs(&clean, &externs)
 }
 
-fn parse_nexa_with_externs(source: &str, externs: &HashMap<String, ExternSig>) -> Result<(Vec<ClassDecl>, Vec<Fun>, Vec<GlobalDecl>), String> {
+fn parse_nexa_with_externs(source: &str, externs: &HashMap<String, ExternSig>) -> Result<(Vec<ClassDecl>, Vec<InterfaceDecl>, Vec<Fun>, Vec<GlobalDecl>), String> {
     let lowered_src = strip_top_level_entry_call(source);
-    let mut p = Parser { t: lex(&lowered_src)?, p: 0, unsafe_depth: 0, extern_names: externs.keys().cloned().collect(), scope_type_param: None };
+    let mut p = Parser { t: lex(&lowered_src)?, p: 0, unsafe_depth: 0, extern_names: externs.keys().cloned().collect(), scope_type_param: None, obj_lit_index: 0 };
     let mut classes = Vec::new();
+    let mut interfaces = Vec::new();
     let mut functions = Vec::new();
     let mut globals = Vec::new();
     while !matches!(p.peek(), Tok::Eof) {
-        if matches!(p.peek(), Tok::Id(k) if k == "class") {
+        if matches!(p.peek(), Tok::Id(k) if k == "interface") {
+            // Type-only structural shape; produces no runtime code. The fields
+            // become a compile-time "layout" (8-byte slot per field, in
+            // declaration order) so field access through an interface-typed
+            // value lowers against the same offsets a satisfying class uses.
             p.eat();
             let name = p.id()?;
+            if classes.iter().any(|c: &ClassDecl| c.name == name) {
+                return Err(format!("duplicate top-level declaration `{name}` (an interface and a class may not share a name)"));
+            }
+            p.expect(|x| matches!(x, Tok::LBrace), "expected {")?;
+            let mut fields = Vec::new();
+            while !matches!(p.peek(), Tok::RBrace | Tok::Eof) {
+                let field_name = p.id()?;
+                if !matches!(p.peek(), Tok::Colon) { return Err(format!("interface field `{field_name}` requires a type annotation")); }
+                let ty = p.annotation(None)?.ok_or_else(|| format!("interface field `{field_name}` requires a type annotation"))?;
+                if !matches!(ty, ir::IrType::Number | ir::IrType::Boolean | ir::IrType::String | ir::IrType::Pointer) {
+                    return Err(format!("interface field `{field_name}` must be number, boolean, string, or Pointer; got {ty:?}"));
+                }
+                fields.push((field_name, ty));
+                p.expect(|x| matches!(x, Tok::Semi), "expected ;")?;
+            }
+            p.expect(|x| matches!(x, Tok::RBrace), "expected }")?;
+            interfaces.push(InterfaceDecl { name, fields });
+        } else if matches!(p.peek(), Tok::Id(k) if k == "class") {
+            p.eat();
+            let name = p.id()?;
+            // `class Coord implements Point` — a compile-time contract verified
+            // by the checker; the parser skips the clause (each named interface
+            // must already be declared before the class).
+            if matches!(p.peek(), Tok::Id(k) if k == "implements") {
+                p.eat();
+                loop {
+                    let _iface = p.id()?;
+                    if matches!(p.peek(), Tok::Comma) { p.eat(); } else { break; }
+                }
+            }
             p.expect(|x| matches!(x, Tok::LBrace), "expected {")?;
             let mut fields = Vec::new();
             let mut constructor_body = None;
@@ -334,7 +381,7 @@ fn parse_nexa_with_externs(source: &str, externs: &HashMap<String, ExternSig>) -
             classes.push(ClassDecl { name, fields, constructor, methods });
         } else if matches!(p.peek(), Tok::Id(k) if k == "let" || k == "const") {
             if let Stmt::Let(n, annotation, e) = p.stmt()? {
-                let ty = annotation.filter(|t| matches!(t, ir::IrType::Number | ir::IrType::Boolean | ir::IrType::String)).ok_or_else(|| format!("top-level global `{n}` requires an explicit number, boolean, or string type annotation"))?;
+                let ty = annotation.filter(|t| matches!(t, ir::IrType::Number | ir::IrType::Boolean | ir::IrType::String | ir::IrType::F32 | ir::IrType::F64)).ok_or_else(|| format!("top-level global `{n}` requires an explicit number, boolean, string, f32, or f64 type annotation"))?;
                 globals.push(GlobalDecl { name: n, ty, init: e });
             } else {
                 return Err("internal: expected a let/const declaration at top level".into());
@@ -343,7 +390,7 @@ fn parse_nexa_with_externs(source: &str, externs: &HashMap<String, ExternSig>) -
             functions.push(p.fun()?);
         }
     }
-    Ok((classes, functions, globals))
+    Ok((classes, interfaces, functions, globals))
 }
 
 fn monomorphize(functions: Vec<Fun>) -> Result<Vec<Fun>, String> {
@@ -419,8 +466,9 @@ fn rewrite_generic_calls_expr(e: &mut Expr, pending: &mut Vec<(String, ir::IrTyp
         Expr::MethodCall(o, _, args) => { rewrite_generic_calls_expr(o, pending, subst)?; for a in args.iter_mut() { rewrite_generic_calls_expr(a, pending, subst)?; } }
         Expr::Call(_, args) | Expr::New(_, args) => for a in args.iter_mut() { rewrite_generic_calls_expr(a, pending, subst)?; },
         Expr::Array(elems) => for a in elems.iter_mut() { rewrite_generic_calls_expr(a, pending, subst)?; },
+        Expr::ObjectLiteral(_, fields) => for (_, v) in fields.iter_mut() { rewrite_generic_calls_expr(v, pending, subst)?; },
         Expr::Closure(body) => rewrite_generic_calls(body, pending, subst)?,
-        Expr::Num(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => {}
+        Expr::Num(_) | Expr::FNum(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) => {}
     }
     Ok(())
 }
@@ -461,12 +509,13 @@ fn subst_expr(e: &mut Expr, ty: ir::IrType) {
         Expr::MethodCall(o, _, args) => { subst_expr(o, ty); for a in args.iter_mut() { subst_expr(a, ty); } }
         Expr::Call(_, args) | Expr::New(_, args) => for a in args.iter_mut() { subst_expr(a, ty); },
         Expr::Array(elems) => for a in elems.iter_mut() { subst_expr(a, ty); },
+        Expr::ObjectLiteral(_, fields) => for (_, v) in fields.iter_mut() { subst_expr(v, ty); },
         Expr::Closure(body) => subst_stmts(body, ty),
-        Expr::Num(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) | Expr::CallGeneric(_, _, _) => {}
+        Expr::Num(_) | Expr::FNum(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) | Expr::CallGeneric(_, _, _) => {}
     }
 }
 
-fn run() -> Result<(), String> { let a: Vec<String> = env::args().collect(); if a.len() < 2 { return Err("usage: nexa <source.ts> [-o executable]".into()); } let flat = modules::resolve_and_flatten(Path::new(&a[1]))?; let (externs, clean) = extract_extern_blocks(&flat)?; let swc_src = blank_unsafe_markers(&clean)?; let module = parse_swc_module(&swc_src, &a[1])?; check_module_with_externs(&module, &externs)?; let (classes, functions, globals) = parse_nexa_with_externs(&clean, &externs)?; let mut functions = monomorphize(functions)?; inject_global_init(&mut functions, &globals); let ir = ir::lower_program(&functions); if env::var_os("NEXA_DUMP_IR").is_some() { eprintln!("{ir}"); } let mut c = Compiler::new()?; c.register_class_layouts(&classes)?; c.declare_externs(&externs)?; c.compile(&classes, &functions, &globals)?; let obj = c.m.finish(); let objpath = "/tmp/nexa.o"; fs::write(objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; let out = a.iter().position(|x| x == "-o").and_then(|i| a.get(i + 1)).cloned().unwrap_or_else(|| "a.out".into()); if !Path::new("runtime.c").exists() { return Err("runtime.c is missing".into()); } let status = Command::new("gcc").args([objpath, "runtime.c", "-o", &out]).status().map_err(|e| e.to_string())?; if !status.success() { return Err("link failed".into()); } println!("built {out}"); Ok(()) }
+fn run() -> Result<(), String> { let a: Vec<String> = env::args().collect(); if a.len() < 2 { return Err("usage: nexa <source.ts> [-o executable]".into()); } let flat = modules::resolve_and_flatten(Path::new(&a[1]))?; let (externs, clean) = extract_extern_blocks(&flat)?; let swc_src = blank_unsafe_markers(&clean)?; let module = parse_swc_module(&swc_src, &a[1])?; check_module_with_externs(&module, &externs)?; let (classes, interfaces, functions, globals) = parse_nexa_with_externs(&clean, &externs)?; let mut functions = monomorphize(functions)?; inject_global_init(&mut functions, &globals); let ir = ir::lower_program(&functions); if env::var_os("NEXA_DUMP_IR").is_some() { eprintln!("{ir}"); } let mut c = Compiler::new()?; c.register_class_layouts(&classes)?; c.register_interface_layouts(&interfaces)?; c.declare_externs(&externs)?; c.compile(&classes, &functions, &globals)?; let obj = c.m.finish(); let objpath = "/tmp/nexa.o"; fs::write(objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; let out = a.iter().position(|x| x == "-o").and_then(|i| a.get(i + 1)).cloned().unwrap_or_else(|| "a.out".into()); if !Path::new("runtime.c").exists() { return Err("runtime.c is missing".into()); } let status = Command::new("gcc").args([objpath, "runtime.c", "-o", &out]).status().map_err(|e| e.to_string())?; if !status.success() { return Err("link failed".into()); } println!("built {out}"); Ok(()) }
 
 #[cfg(test)]
 mod safety_tests {
@@ -504,7 +553,7 @@ mod safety_tests {
         "#;
         let module = parse_swc_module(source, "array-any.ts").expect("SWC parse");
         checker::check_module(&module).expect("number[] should pass the checker");
-        let (_, functions, _globals) = parse_nexa(source).expect("parse nexa");
+        let (_, _interfaces, functions, _globals) = parse_nexa(source).expect("parse nexa");
         assert_eq!(functions[0].param_types, vec![ir::IrType::NumberArray]);
         assert!(matches!(
             functions[1].body.first(),
@@ -537,7 +586,7 @@ mod safety_tests {
             }
             main();
         "#;
-        let (classes, functions, _globals) = parse_nexa(source).expect("should parse sized array construction");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("should parse sized array construction");
         let mut c = Compiler::new().expect("compiler init");
         c.declare_externs(&HashMap::new()).expect("no externs");
         c.compile(&classes, &functions, &[]).expect("compile array program");
@@ -579,7 +628,7 @@ mod safety_tests {
     }
 
     fn build_and_run_prog(source: &str, tag: &str) -> String {
-        let (classes, functions, _globals) = parse_nexa(source).expect("parse nexa program");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parse nexa program");
         let mut c = Compiler::new().expect("compiler init");
         c.declare_externs(&HashMap::new()).expect("no externs");
         c.compile(&classes, &functions, &[]).expect("compile program");
@@ -601,7 +650,7 @@ mod safety_tests {
         let swc_src = blank_unsafe_markers(&clean).expect("blank unsafe markers");
         let module = parse_swc_module(&swc_src, &format!("{tag}.ts")).expect("swc parse");
         check_module_with_externs(&module, &externs).expect("type check");
-        let (classes, functions, _globals) = parse_nexa_with_externs(&clean, &externs).expect("parse nexa program with externs");
+        let (classes, _interfaces, functions, _globals) = parse_nexa_with_externs(&clean, &externs).expect("parse nexa program with externs");
         let mut c = Compiler::new().expect("compiler init");
         c.register_class_layouts(&classes).expect("register class layouts");
         c.declare_externs(&externs).expect("declare extern imports");
@@ -919,6 +968,55 @@ mod safety_tests {
     }
 
     #[test]
+    fn extern_class_with_non_ffi_safe_field_is_rejected() {
+        // Classes may cross an extern "C" boundary by value only when every
+        // field is FFI-safe (number/boolean, each occupying one 8-byte slot).
+        // A class carrying a string (pointer-tagged runtime type, not a
+        // fixed-layout scalar) must be rejected in both directions.
+        for kind in ["param", "return"] {
+            let source = match kind {
+                "param" => r#"
+                    extern "C" {
+                      function bump(p: Bad): void;
+                    }
+                    class Bad {
+                      tag: string;
+                    }
+                "#,
+                _ => r#"
+                    extern "C" {
+                      function read(): Bad;
+                    }
+                    class Bad {
+                      tag: string;
+                    }
+                "#,
+            };
+            let (externs, clean) = extract_extern_blocks(source).expect("extract extern");
+            let err = compile_with_externs(&clean, &externs)
+                .expect_err("a class with a non-FFI-safe field must fail compilation");
+            assert!(err.contains("non-integer field"), "{kind}: {err}");
+            assert!(err.contains("Bad"), "{kind}: {err}");
+        }
+    }
+
+    #[test]
+    fn extern_class_not_declared_in_program_is_rejected() {
+        // The struct type named in an extern signature must be a class declared
+        // in the program (its field layout defines the C struct). A dangling
+        // name must not silently fall back to a scalar signature.
+        let source = r#"
+            extern "C" {
+              function poke(p: Ghost): void;
+            }
+        "#;
+        let (externs, clean) = extract_extern_blocks(source).expect("extract extern");
+        let err = compile_with_externs(&clean, &externs)
+            .expect_err("an undeclared struct type must fail compilation");
+        assert!(err.contains("Ghost"), "{err}");
+    }
+
+    #[test]
     fn for_of_array_desugars_to_indexed_loop() {
         // for (const x of arr) must reduce to the existing indexed for(;;): it
         // reads arr.length for the bound and arr[__i] for each element. Values
@@ -1201,7 +1299,7 @@ mod safety_tests {
             main();
         "#;
         parse_typescript(source, "class-counter.ts").expect("type checker should accept classes");
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle classes");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle classes");
         assert_eq!(classes.len(), 1, "should parse one class");
         assert_eq!(classes[0].name, "Counter");
         assert_eq!(classes[0].fields.len(), 1);
@@ -1242,7 +1340,7 @@ mod safety_tests {
         "#;
         parse_typescript(source, "extern-acceptance.ts")
             .expect("type checker should accept extern declarations and unsafe blocks");
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle extern/unsafe");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle extern/unsafe");
         assert!(classes.is_empty());
         let (externs, _) = extract_extern_blocks(source).expect("extract extern signatures");
         assert_eq!(externs.len(), 2);
@@ -1303,7 +1401,7 @@ mod safety_tests {
         "#;
         parse_typescript(source, "std-hello.ts")
             .expect("type checker should accept std.log/std.in without unsafe");
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle the std namespace");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle the std namespace");
         assert!(matches!(
             functions[0].body.first(),
             Some(Stmt::Expr(Expr::Call(n, _))) if n == "std.log"
@@ -1351,7 +1449,7 @@ mod safety_tests {
             }
         "#;
         parse_typescript(source, "generic.ts").expect("type checker should accept generic functions with explicit instantiation");
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle generic declarations and call sites");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle generic declarations and call sites");
         assert_eq!(functions[0].type_param.as_deref(), Some("T"));
         assert!(matches!(
             functions[0].param_types.as_slice(),
@@ -1420,7 +1518,7 @@ mod safety_tests {
             }
         "#;
         parse_typescript(source, "parse-number.ts").expect("type checker should accept std.parseNumber");
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle std.parseNumber");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle std.parseNumber");
         assert!(functions[0].body.iter().any(|s| matches!(
             s,
             Stmt::Let(_, Some(ir::IrType::Number), Expr::Call(n, args)) if n == "std.parseNumber" && args.len() == 1
@@ -1463,7 +1561,7 @@ mod safety_tests {
               return 0;
             }
         "#;
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle std.parseNumber");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle std.parseNumber");
         let mut c = Compiler::new().expect("compiler init");
         c.compile(&classes, &functions, &[]).expect("compile parseNumber program");
         let obj = c.m.finish();
@@ -1517,7 +1615,7 @@ mod safety_tests {
             main();
         "#;
         parse_typescript(source, "class-string-field.ts").expect("type checker should accept string fields");
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle string fields");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle string fields");
         assert_eq!(classes.len(), 1, "should parse one class");
         assert_eq!(classes[0].name, "Person");
         assert_eq!(classes[0].fields.len(), 1);
@@ -1569,7 +1667,7 @@ mod safety_tests {
               return 0;
             }
         "#;
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle Pointer fields and std.toCString");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle Pointer fields and std.toCString");
         assert_eq!(classes.len(), 1, "should parse Widget class");
         assert_eq!(classes[0].name, "Widget");
         assert_eq!(classes[0].fields.len(), 1);
@@ -1624,7 +1722,7 @@ mod safety_tests {
               return 0;
             }
         "#;
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle std.fromCString");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle std.fromCString");
         let (externs, _) = extract_extern_blocks(source).expect("extract extern signatures");
         assert_eq!(externs.len(), 1);
         assert_eq!(externs["nexa_str_free"].params, vec![Ty::Pointer]);
@@ -1665,7 +1763,7 @@ mod safety_tests {
               return 0;
             }
         "#;
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle \\x00 escapes and std.fromCString");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle \\x00 escapes and std.fromCString");
         let (externs, _) = extract_extern_blocks(source).expect("extract extern signatures");
         let mut c = Compiler::new().expect("compiler init");
         c.declare_externs(&externs).expect("declare extern imports");
@@ -1704,7 +1802,7 @@ mod safety_tests {
               return 0;
             }
         "#;
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle string concat and ==");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle string concat and ==");
         let mut c = Compiler::new().expect("compiler init");
         c.declare_externs(&HashMap::new()).expect("no externs");
         c.compile(&classes, &functions, &[]).expect("compile string == program");
@@ -1739,7 +1837,7 @@ mod safety_tests {
               return 0;
             }
         "#;
-        let (classes, functions, _globals) = parse_nexa(source).expect("parser should handle string concat and ==");
+        let (classes, _interfaces, functions, _globals) = parse_nexa(source).expect("parser should handle string concat and ==");
         let mut c = Compiler::new().expect("compiler init");
         c.declare_externs(&HashMap::new()).expect("no externs");
         c.compile(&classes, &functions, &[]).expect("compile string == program");
@@ -1777,7 +1875,7 @@ mod safety_tests {
             }
         "#;
         let (externs, clean) = extract_extern_blocks(source).expect("extract extern");
-        let (classes, functions, _globals) = parse_nexa_with_externs(&clean, &externs).expect("parse funcPtr program");
+        let (classes, _interfaces, functions, _globals) = parse_nexa_with_externs(&clean, &externs).expect("parse funcPtr program");
         let mut c = Compiler::new().expect("compiler init");
         c.declare_externs(&externs).expect("declare externs");
         c.compile(&classes, &functions, &[]).expect("compile funcPtr program");
@@ -1863,11 +1961,12 @@ mod safety_tests {
         let filename = entry.file_name().unwrap_or_default().to_string_lossy().to_string();
         let module = parse_swc_module(&swc_src, &filename)?;
         check_module_with_externs(&module, &externs)?;
-        let (classes, functions, globals) = parse_nexa_with_externs(&clean, &externs)?;
+        let (classes, interfaces, functions, globals) = parse_nexa_with_externs(&clean, &externs)?;
         let mut functions = monomorphize(functions)?;
         inject_global_init(&mut functions, &globals);
         let mut c = Compiler::new().map_err(|e| e.to_string())?;
         c.register_class_layouts(&classes)?;
+        c.register_interface_layouts(&interfaces)?;
         c.declare_externs(&externs)?;
         c.compile(&classes, &functions, &globals)?;
         let unique = entry.parent().unwrap_or(Path::new("/tmp")).join(entry.file_stem().unwrap_or_default());
@@ -1887,10 +1986,11 @@ mod safety_tests {
         let filename = entry.file_name().unwrap_or_default().to_string_lossy().to_string();
         let module = parse_swc_module(&swc_src, &filename)?;
         check_module_with_externs(&module, &externs)?;
-        let (classes, functions, globals) = parse_nexa_with_externs(&clean, &externs)?;
+        let (classes, interfaces, functions, globals) = parse_nexa_with_externs(&clean, &externs)?;
         let mut functions = monomorphize(functions)?;
         inject_global_init(&mut functions, &globals);
         let mut c = Compiler::new().map_err(|e| e.to_string())?;
+        c.register_interface_layouts(&interfaces)?;
         c.declare_externs(&externs)?;
         c.compile(&classes, &functions, &globals)?;
         Ok(())
@@ -2010,12 +2110,432 @@ mod safety_tests {
         let err = build_error(&entry).unwrap_err();
         assert!(err.contains("circular import"), "cross-file global cycle must be caught by circular-import detection, got: {err}");
     }
+
+    #[test]
+    fn f64_literals_arithmetic_and_comparison() {
+        // f64 values flow through locals, params, returns and binary ops; the
+        // int literal participates via implicit int->f64 widening.
+        let source = r#"
+            function main(): number {
+              let a: f64 = 1.5;
+              let b: f64 = 2.25;
+              std.log(a + b);            // 3.75
+              std.log(b - a);            // 0.75
+              std.log(a * b);            // 3.375
+              std.log(b / a);            // 1.5
+              std.log(a + 1);            // 2.5 (int widened)
+              std.log(10 - a * 4);       // 4
+              std.log(a == 1.5);         // true
+              std.log(a < b);            // true
+              std.log(a >= 5);           // false
+              return 0;
+            }
+            main();
+        "#;
+        let out = build_and_run_prog(source, "f64_arith");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["3.75", "0.75", "3.375", "1.5", "2.5", "4", "true", "true", "false"]);
+    }
+
+    #[test]
+    fn f32_arithmetic_and_casts() {
+        // std.toF32 demotes literals/values to f32; f32 op f32 stays f32.
+        let source = r#"
+            function main(): number {
+              let a: f32 = std.toF32(1.5);
+              let b: f32 = std.toF32(2.0);
+              std.log(a + b);            // 3.5
+              std.log(a * b);            // 3
+              let back: f64 = std.toF64(a);
+              std.log(back);             // 1.5 (promoted)
+              std.log(std.toInt(a + b)); // 3 (truncation not rounding)
+              let d: f64 = a + 3;        // f32 promotes to f64 with int
+              std.log(d);                // 4.5
+              return 0;
+            }
+            main();
+        "#;
+        let out = build_and_run_prog(source, "f32_arith");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["3.5", "3", "1.5", "3", "4.5"]);
+    }
+
+    #[test]
+    fn f64_internal_function_roundtrip() {
+        // f64 params and returns use the XMM registers end to end.
+        let source = r#"
+            function scale(x: f64, f: number): f64 {
+              return x * std.toF64(f);
+            }
+            function main(): number {
+              std.log(scale(0.5, 3));   // 1.5
+              std.log(scale(2.0, 10));  // 20
+              return 0;
+            }
+            main();
+        "#;
+        let out = build_and_run_prog(source, "f64_fn");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["1.5", "20"]);
+    }
+
+    #[test]
+    fn f64_and_f32_arrays_store_and_iterate() {
+        let source = r#"
+            function main(): number {
+              let a: f64[] = new Array<f64>(3);
+              a[0] = 1.5;
+              a[1] = 2.0;
+              a[2] = 2.5;
+              let sum: f64 = 0.0;
+              for (const x of a) {
+                sum = sum + x;
+              }
+              std.log(sum);              // 6
+              let f: f32[] = new Array<f32>(2);
+              f[0] = std.toF32(1.25);
+              f[1] = std.toF32(0.5);
+              std.log(f[0] + f[1]);      // 1.75
+              let n: number = f.length;
+              std.log(n);                // 2
+              return 0;
+            }
+            main();
+        "#;
+        let out = build_and_run_prog(source, "f_arrays");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["6", "1.75", "2"]);
+    }
+
+    #[test]
+    fn float_class_field_mixed_layout() {
+        // Fields keep offset-accurate sizes (f64 8B, f32 4B, number 8B).
+        let source = r#"
+            class Meter {
+              value: f64;
+              state: number;
+              cons: f32;
+              constructor(v: f64) {
+                this.value = v;
+                this.state = 0;
+                this.cons = std.toF32(0.5);
+              }
+              bump(): f64 {
+                this.state = this.state + 1;
+                return this.value * std.toF64(this.cons) + this.state;
+              }
+            }
+            function main(): number {
+              let m = new Meter(4.0);
+              std.log(m.bump());         // 1 + 4*0.5 = 3
+              std.log(m.bump());         // 2 + 2 = 4
+              m.value = 10.0;
+              std.log(m.bump());         // 3 + 5 = 8
+              std.log(m.state);
+              return 0;
+            }
+            main();
+        "#;
+        let out = build_and_run_prog(source, "f_class");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["3", "4", "8", "3"]);
+    }
+
+    #[test]
+    fn float_global_initialization_and_read() {
+        let dir = scratch_dir("fglob");
+        let entry = write_module(&dir, "main.ts", r#"
+            let G: f64 = 2.5;
+            let H: f64 = G * 2;
+            let I: f32 = std.toF32(1.5);
+            function main(): number {
+              std.log(G);   // 2.5
+              std.log(H);   // 5
+              std.log(I);   // 1.5
+              G = 3.25;
+              std.log(G);   // 3.25
+              return 0;
+            }
+            main();
+        "#);
+        let out = build_and_run(&entry).expect("float globals must compile and run");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["2.5", "5", "1.5", "3.25"]);
+    }
+
+    #[test]
+    fn extern_xmm_double_and_float_roundtrip() {
+        // Scalar f64/f32 extern params/returns travel in XMM registers.
+        let source = r#"
+            extern "C" {
+              function nexa_abi_f64_square(x: f64): f64;
+              function nexa_abi_f32_wacky(a: f32, b: number): f32;
+            }
+
+            function main(): number {
+              let q: f64 = unsafe { nexa_abi_f64_square(1.5) };
+              std.log(q);                     // 2.25
+              std.log(unsafe { nexa_abi_f64_square(3.0) });  // 9
+              let w: f32 = unsafe { nexa_abi_f32_wacky(std.toF32(0.5), 3) };
+              std.log(w);                     // 0.5 + 3 = 3.5
+              return 0;
+            }
+            main();
+        "#;
+        let c_helpers = r#"
+            #include <stdint.h>
+            double nexa_abi_f64_square(double x) { return x * x; }
+            float nexa_abi_f32_wacky(float a, int64_t b) { return a + (float)b; }
+        "#;
+        let out = build_and_run_prog_with_c(source, c_helpers, "abi_xmm");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["2.25", "9", "3.5"]);
+    }
+
+    #[test]
+    fn float_int_conversions_are_explicit() {
+        let source = r#"
+            function main(): number {
+              std.log(std.toInt(2.7));     // 2 (truncates)
+              std.log(std.toInt(std.toF32(2.7)));  // 2
+              std.log(std.toF64(7) / 2.0); // 3.5
+              return 0;
+            }
+            main();
+        "#;
+        let out = build_and_run_prog(source, "f_casts");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["2", "2", "3.5"]);
+    }
+
+    #[test]
+    fn float_destinations_accept_literals_and_cross_float_values() {
+        // An f32/f64 destination takes any float-domain value implicitly:
+        // typed-global/local demotion (f64 literal -> f32), and promotion.
+        let dir = scratch_dir("fdest");
+        let entry = write_module(&dir, "main.ts", r#"
+            let float: f32 = 0.5;      // f64 literal demotes to the f32 slot
+            function main(): number {
+              let a: f32 = 1.5;        // local f32 from a literal
+              let b: f64 = a;          // f32 promotes to f64 implicitly
+              std.log(a);              // 1.5
+              std.log(b);              // 1.5
+              std.log(float);          // 0.5
+              float = 2.25;            // f64 expression demotes into f32
+              std.log(float);          // 2.25
+              let pi: f64 = 3.14159;
+              let rounded: f32 = pi;   // f64 -> f32 at an annotated f32 target
+              std.log(rounded);        // 3.14159
+              return 0;
+            }
+            main();
+        "#);
+        let out = build_and_run(&entry).expect("float destinations must compile and run");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["1.5", "1.5", "0.5", "2.25", "3.14159"]);
+    }
+
+    #[test]
+    fn modulo_on_floats_is_rejected() {
+        let source = r#"
+            function main(): number {
+              let a: f64 = 5.0;
+              std.log(a % 2.0);
+              return 0;
+            }
+            main();
+        "#;
+        let err = parse_typescript(source, "f_mod.ts").unwrap_err();
+        assert!(err.contains("not supported on float"), "expected float modulo rejection, got: {err}");
+    }
+
+    #[test]
+    fn float_struct_by_value_is_deferred_error() {
+        // The float struct ABI (SSE eightbyte classification) is out of this
+        // pass's scope: extern-by-value structs must still be integer-only.
+        let source = r#"
+            extern "C" {
+              function nexa_abi_f_struct(p: P): number;
+            }
+            class P {
+              x: f64;
+              constructor(x: f64) { this.x = x; }
+            }
+            function main(): number { return 0; }
+            main();
+        "#;
+        let (externs, clean) = extract_extern_blocks(source).expect("extract extern blocks");
+        let err = compile_with_externs(&clean, &externs).unwrap_err();
+        assert!(err.contains("f32/f64 fields"), "expected float-struct deferral error, got: {err}");
+    }
+
+    #[test]
+    fn structural_interfaces_accept_matching_class() {
+        // A class satisfies an interface structurally: it declares every
+        // interface field with the same type, in the same order. No `implements`
+        // keyword is required; an interface-typed parameter reads fields through
+        // the interface's own (identical) layout.
+        let dir = scratch_dir("ifeq");
+        let entry = write_module(&dir, "main.ts", r#"
+            interface Point {
+              x: number;
+              y: number;
+            }
+            class Coord {
+              x: number;
+              y: number;
+              constructor(x: number, y: number) {
+                this.x = x;
+                this.y = y;
+              }
+            }
+            function printPoint(p: Point): void {
+              std.log(p.x);
+              std.log(p.y);
+            }
+            function main(): number {
+              let c = new Coord(3, 4);
+              printPoint(c);
+              return 0;
+            }
+            main();
+        "#);
+        let out = build_and_run(&entry).expect("matching class must compile and run");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["3", "4"]);
+    }
+
+    #[test]
+    fn structural_interfaces_reject_missing_field() {
+        // A class missing one of the interface's required fields is rejected by
+        // the checker when an interface-typed value is handed a concrete class.
+        let source = r#"
+            interface Point {
+              x: number;
+              y: number;
+            }
+            class OneD {
+              x: number;
+              constructor(x: number) {
+                this.x = x;
+              }
+            }
+            function printPoint(p: Point): void {
+              std.log(p.x);
+              std.log(p.y);
+            }
+            function main(): number {
+              let o = new OneD(1);
+              printPoint(o);
+              return 0;
+            }
+            main();
+        "#;
+        let err = parse_typescript(source, "ifneg.ts").unwrap_err();
+        assert!(err.contains("does not satisfy interface Point"), "expected structural rejection, got: {err}");
+    }
+
+    #[test]
+    fn structural_interfaces_verify_implements_clause() {
+        // `implements` is optional; when written, the clause must name a known
+        // interface and the class must satisfy it structurally.
+        let source = r#"
+            interface Point {
+              x: number;
+              y: number;
+            }
+            class Fake implements Point {
+              x: number;
+              constructor(x: number) {
+                this.x = x;
+              }
+            }
+            function main(): number {
+              return 0;
+            }
+            main();
+        "#;
+        let err = parse_typescript(source, "ifimp.ts").unwrap_err();
+        assert!(err.contains("does not satisfy interface Point"), "expected implements verification, got: {err}");
+    }
+
+    #[test]
+    fn object_literals_match_interface_acceptance() {
+        // Inline literal in a call argument and a literal initializing an
+        // explicitly-interface-typed let; each site synthesizes its own layout.
+        let dir = scratch_dir("objacc");
+        let entry = write_module(&dir, "main.ts", r#"
+            interface Point {
+              x: number;
+              y: number;
+            }
+            function printPoint(p: Point): void {
+              std.log(p.x);
+              std.log(p.y);
+            }
+            function main(): number {
+              printPoint({ x: 5, y: 6 });
+
+              let p: Point = { x: 7, y: 8 };
+              printPoint(p);
+
+              return 0;
+            }
+            main();
+        "#);
+        let out = build_and_run(&entry).expect("object literal acceptance must compile and run");
+        assert_eq!(out.lines().collect::<Vec<_>>(), vec!["5", "6", "7", "8"]);
+    }
+
+    #[test]
+    fn object_literal_missing_interface_field_is_rejected() {
+        let source = r#"
+            interface Point {
+              x: number;
+              y: number;
+            }
+            function printPoint(p: Point): void {}
+            function main(): number {
+              printPoint({ x: 5 });
+              return 0;
+            }
+            main();
+        "#;
+        let err = parse_typescript(source, "objmiss.ts").unwrap_err();
+        assert!(err.contains("object literal does not match interface Point"), "expected missing-field rejection, got: {err}");
+        assert!(err.contains("expected 2 field(s)"), "expected field-count diagnostic, got: {err}");
+    }
+
+    #[test]
+    fn object_literal_mismatched_field_type_is_rejected() {
+        let source = r#"
+            interface Point {
+              x: number;
+              y: number;
+            }
+            function printPoint(p: Point): void {}
+            function main(): number {
+              printPoint({ x: "five", y: 6 });
+              return 0;
+            }
+            main();
+        "#;
+        let err = parse_typescript(source, "objty.ts").unwrap_err();
+        assert!(err.contains("object literal does not match interface Point"), "expected type-mismatch rejection, got: {err}");
+        assert!(err.contains("field `x` has type String"), "expected field-type diagnostic, got: {err}");
+    }
+
+    #[test]
+    fn object_literal_requires_named_interface_destination() {
+        // Bare anonymous object destinations (let x: {a: number} = ...) and
+        // untyped object literals are out of scope for this version.
+        let source = r#"
+            function main(): number {
+              let x: { a: number } = { a: 1 };
+              return 0;
+            }
+            main();
+        "#;
+        let err = parse_typescript(source, "objanon.ts").unwrap_err();
+        assert!(err.contains("Nexa type-level checker supports only scalar keyword types"), "expected anonymous-type rejection, got: {err}");
+    }
 }
 
 fn compile_with_externs(source: &str, externs: &HashMap<String, ExternSig>) -> Result<(), String> {
-    let (classes, functions, _globals) = parse_nexa_with_externs(source, externs)?;
+    let (classes, interfaces, functions, _globals) = parse_nexa_with_externs(source, externs)?;
     let mut c = Compiler::new().map_err(|e| e.to_string())?;
     c.register_class_layouts(&classes)?;
+    c.register_interface_layouts(&interfaces)?;
     c.declare_externs(externs)?;
     c.compile(&classes, &functions, &[])?;
     Ok(())

@@ -39,6 +39,8 @@ int64_t nexa_print_i64(int64_t x) {
     return x;
 }
 int64_t nexa_print_str(int64_t p, int64_t n) { fwrite((const void*)p, 1, (size_t)n, stdout); fputc('\n', stdout); return 0; }
+int64_t nexa_print_f64(double x) { printf("%g\n", x); return 0; }
+int64_t nexa_print_f32(float x) { printf("%g\n", x); return 0; }
 
 int64_t nexa_stdin_line(void) {
     char buf[1024];
@@ -78,6 +80,15 @@ int64_t nexa_array_get(int64_t array, int64_t index) {
 
 int64_t nexa_array_set(int64_t array, int64_t index, int64_t value) {
     ((int64_t *)(uintptr_t)array)[index] = value;
+    return value;
+}
+
+int64_t nexa_array_get_f32(int64_t array, int64_t index) {
+    return (int64_t)(int32_t)((int32_t *)(uintptr_t)array)[index];
+}
+
+int64_t nexa_array_set_f32(int64_t array, int64_t index, int64_t value) {
+    ((int32_t *)(uintptr_t)array)[index] = (int32_t)value;
     return value;
 }
 

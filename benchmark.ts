@@ -48,7 +48,7 @@ function countPrimes(limit: number): number {
 
 // 4. Array-heavy workload — stresses memory allocation and load/store.
 function sumOfSquaresArray(n: number): number {
-  let arr: number[] = [];
+  let arr: number[] = new Array<number>(n);
   for (let i: number = 0; i < n; i = i + 1) {
     arr[i] = i * i;
   }
@@ -62,7 +62,7 @@ function sumOfSquaresArray(n: number): number {
 // 5. Bubble sort — stresses nested loops, comparisons, and swapping via
 // array writes (no built-in sort allowed).
 function bubbleSort(n: number): number {
-  let arr: number[] = [];
+  let arr: number[] = new Array<number>(n);
   for (let i: number = 0; i < n; i = i + 1) {
     arr[i] = n - i; // reverse order, worst case for bubble sort
   }

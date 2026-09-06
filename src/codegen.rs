@@ -1,5 +1,5 @@
 use cranelift_codegen::ir::{types, AbiParam, ArgumentPurpose, Function, InstBuilder, MemFlags, Signature, Value};
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::settings;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
@@ -10,15 +10,46 @@ use crate::checker::ClassDef;
 use crate::ir;
 use crate::ir::Ty;
 use crate::stdlib;
-use crate::{leak_str, ClassDecl, Expr, ExternSig, Fun, GlobalDecl, Stmt};
+use crate::{leak_str, ClassDecl, Expr, ExternSig, Fun, GlobalDecl, InterfaceDecl, Stmt};
 
-fn inferred_ir_type(e: &Expr) -> ir::IrType { match e { Expr::Num(_) => ir::IrType::Number, Expr::Bool(_) => ir::IrType::Boolean, Expr::Closure(_) => ir::IrType::ClosureNumber, Expr::New(name, _) => ir::IrType::Class(leak_str(name)), Expr::FieldAccess(_, _) => ir::IrType::Number, _ => ir::IrType::Any } }
+fn inferred_ir_type(e: &Expr) -> ir::IrType { match e { Expr::Num(_) => ir::IrType::Number, Expr::FNum(_) => ir::IrType::F64, Expr::Bool(_) => ir::IrType::Boolean, Expr::Closure(_) => ir::IrType::ClosureNumber, Expr::Str(_) => ir::IrType::String, Expr::New(name, _) => ir::IrType::Class(leak_str(name)), Expr::ObjectLiteral(name, _) => ir::IrType::Class(leak_str(name)), Expr::FieldAccess(_, _) => ir::IrType::Number, _ => ir::IrType::Any } }
 fn add_ref(name: &str, refs: &mut Vec<String>) { if !refs.iter().any(|x| x == name) { refs.push(name.to_string()); } }
-fn collect_expr_refs(e: &Expr, refs: &mut Vec<String>, mutated: &mut HashSet<String>) -> Result<(), String> { match e { Expr::Var(n) => add_ref(n, refs), Expr::Bin(a, _, b) => { collect_expr_refs(a, refs, mutated)?; collect_expr_refs(b, refs, mutated)?; }, Expr::Unary(_, x) => collect_expr_refs(x, refs, mutated)?, Expr::Index(a, i) => { collect_expr_refs(a, refs, mutated)?; collect_expr_refs(i, refs, mutated)?; }, Expr::Call(_, args) | Expr::CallGeneric(_, _, args) => for a in args { collect_expr_refs(a, refs, mutated)?; }, Expr::FieldAccess(obj, _) => collect_expr_refs(obj, refs, mutated)?, Expr::MethodCall(obj, _, args) => { collect_expr_refs(obj, refs, mutated)?; for a in args { collect_expr_refs(a, refs, mutated)?; } }, Expr::Array(elems) => for a in elems { collect_expr_refs(a, refs, mutated)?; }, Expr::Closure(_) => return Err("nested closures are not supported in Nexa v1".into()), Expr::Num(_) | Expr::Bool(_) | Expr::Str(_) | Expr::New(_, _) => {} } Ok(()) }
+fn collect_expr_refs(e: &Expr, refs: &mut Vec<String>, mutated: &mut HashSet<String>) -> Result<(), String> { match e { Expr::Var(n) => add_ref(n, refs), Expr::Bin(a, _, b) => { collect_expr_refs(a, refs, mutated)?; collect_expr_refs(b, refs, mutated)?; }, Expr::Unary(_, x) => collect_expr_refs(x, refs, mutated)?, Expr::Index(a, i) => { collect_expr_refs(a, refs, mutated)?; collect_expr_refs(i, refs, mutated)?; }, Expr::Call(_, args) | Expr::CallGeneric(_, _, args) => for a in args { collect_expr_refs(a, refs, mutated)?; }, Expr::FieldAccess(obj, _) => collect_expr_refs(obj, refs, mutated)?, Expr::MethodCall(obj, _, args) => { collect_expr_refs(obj, refs, mutated)?; for a in args { collect_expr_refs(a, refs, mutated)?; } }, Expr::Array(elems) => for a in elems { collect_expr_refs(a, refs, mutated)?; }, Expr::ObjectLiteral(_, fields) => for (_, v) in fields { collect_expr_refs(v, refs, mutated)?; }, Expr::Closure(_) => return Err("nested closures are not supported in Nexa v1".into()), Expr::Num(_) | Expr::FNum(_) | Expr::Bool(_) | Expr::Str(_) | Expr::New(_, _) => {} } Ok(()) }
 fn collect_stmt_refs(s: &Stmt, refs: &mut Vec<String>, mutated: &mut HashSet<String>) -> Result<(), String> { match s { Stmt::Let(_, _, e) | Stmt::Return(e) | Stmt::Expr(e) => collect_expr_refs(e, refs, mutated)?, Stmt::Assign(n, e) => { add_ref(n, refs); mutated.insert(n.clone()); collect_expr_refs(e, refs, mutated)?; }, Stmt::FieldAssign(obj, _, e) => { collect_expr_refs(obj, refs, mutated)?; collect_expr_refs(e, refs, mutated)?; }, Stmt::IndexAssign(a, i, e) => { collect_expr_refs(a, refs, mutated)?; collect_expr_refs(i, refs, mutated)?; collect_expr_refs(e, refs, mutated)?; }, Stmt::Block(body) => for s in body { collect_stmt_refs(s, refs, mutated)?; }, Stmt::If(c, yes, no) => { collect_expr_refs(c, refs, mutated)?; for s in yes.iter().chain(no) { collect_stmt_refs(s, refs, mutated)?; } }, Stmt::While(c, body) => { collect_expr_refs(c, refs, mutated)?; for s in body { collect_stmt_refs(s, refs, mutated)?; } }, Stmt::For(init, c, update, body) => { collect_stmt_refs(init, refs, mutated)?; collect_expr_refs(c, refs, mutated)?; collect_stmt_refs(update, refs, mutated)?; for s in body { collect_stmt_refs(s, refs, mutated)?; } }, Stmt::ForOf(iter, bname, body) => { add_ref(bname, refs); collect_expr_refs(iter, refs, mutated)?; for s in body { collect_stmt_refs(s, refs, mutated)?; } } } Ok(()) }
-fn find_closure_expr(e: &Expr, found: &mut Vec<Vec<Stmt>>) -> Result<(), String> { match e { Expr::Closure(body) => { found.push(body.clone()); }, Expr::Bin(a, _, b) => { find_closure_expr(a, found)?; find_closure_expr(b, found)?; }, Expr::Unary(_, x) => find_closure_expr(x, found)?, Expr::Index(a, i) => { find_closure_expr(a, found)?; find_closure_expr(i, found)?; }, Expr::Call(_, args) | Expr::CallGeneric(_, _, args) => for a in args { find_closure_expr(a, found)?; }, Expr::FieldAccess(obj, _) => find_closure_expr(obj, found)?, Expr::MethodCall(obj, _, args) => { find_closure_expr(obj, found)?; for a in args { find_closure_expr(a, found)?; } }, Expr::Array(elems) => for a in elems { find_closure_expr(a, found)?; }, Expr::Num(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) | Expr::New(_, _) => {} } Ok(()) }
+fn find_closure_expr(e: &Expr, found: &mut Vec<Vec<Stmt>>) -> Result<(), String> { match e { Expr::Closure(body) => { found.push(body.clone()); }, Expr::Bin(a, _, b) => { find_closure_expr(a, found)?; find_closure_expr(b, found)?; }, Expr::Unary(_, x) => find_closure_expr(x, found)?, Expr::Index(a, i) => { find_closure_expr(a, found)?; find_closure_expr(i, found)?; }, Expr::Call(_, args) | Expr::CallGeneric(_, _, args) => for a in args { find_closure_expr(a, found)?; }, Expr::FieldAccess(obj, _) => find_closure_expr(obj, found)?, Expr::MethodCall(obj, _, args) => { find_closure_expr(obj, found)?; for a in args { find_closure_expr(a, found)?; } }, Expr::Array(elems) => for a in elems { find_closure_expr(a, found)?; }, Expr::ObjectLiteral(_, fields) => for (_, v) in fields { find_closure_expr(v, found)?; }, Expr::Num(_) | Expr::FNum(_) | Expr::Bool(_) | Expr::Str(_) | Expr::Var(_) | Expr::New(_, _) => {} } Ok(()) }
 fn find_closure_stmt(s: &Stmt, found: &mut Vec<Vec<Stmt>>) -> Result<(), String> { match s { Stmt::Let(_, _, e) | Stmt::Return(e) | Stmt::Expr(e) => find_closure_expr(e, found)?, Stmt::Assign(_, e) => find_closure_expr(e, found)?, Stmt::FieldAssign(obj, _, e) => { find_closure_expr(obj, found)?; find_closure_expr(e, found)?; }, Stmt::IndexAssign(a, i, e) => { find_closure_expr(a, found)?; find_closure_expr(i, found)?; find_closure_expr(e, found)?; }, Stmt::Block(body) => for s in body { find_closure_stmt(s, found)?; }, Stmt::If(c, yes, no) => { find_closure_expr(c, found)?; for s in yes.iter().chain(no) { find_closure_stmt(s, found)?; } }, Stmt::While(c, body) => { find_closure_expr(c, found)?; for s in body { find_closure_stmt(s, found)?; } }, Stmt::For(init, c, update, body) => { find_closure_stmt(init, found)?; find_closure_expr(c, found)?; find_closure_stmt(update, found)?; for s in body { find_closure_stmt(s, found)?; } }, Stmt::ForOf(iter, _, body) => { find_closure_expr(iter, found)?; for s in body { find_closure_stmt(s, found)?; } } } Ok(()) }
 fn collect_outer_mutations(s: &Stmt, mutated: &mut HashSet<String>) { match s { Stmt::Assign(n, _) => { mutated.insert(n.clone()); }, Stmt::Block(body) => for x in body { collect_outer_mutations(x, mutated); }, Stmt::If(_, yes, no) => for x in yes.iter().chain(no) { collect_outer_mutations(x, mutated); }, Stmt::While(_, body) => for x in body { collect_outer_mutations(x, mutated); }, Stmt::For(init, _, update, body) => { collect_outer_mutations(init, mutated); collect_outer_mutations(update, mutated); for x in body { collect_outer_mutations(x, mutated); } }, Stmt::ForOf(_, _, body) => { for x in body { collect_outer_mutations(x, mutated); } }, Stmt::Let(_, _, _) | Stmt::Return(_) | Stmt::Expr(_) | Stmt::IndexAssign(_, _, _) | Stmt::FieldAssign(_, _, _) => {} } }
+
+fn ir_val_type(t: ir::IrType) -> types::Type {
+    match t {
+        ir::IrType::F32 => types::F32,
+        ir::IrType::F64 => types::F64,
+        _ => types::I64,
+    }
+}
+fn is_float(t: ir::IrType) -> bool { t == ir::IrType::F32 || t == ir::IrType::F64 }
+fn array_elem_kind(kind: ir::IrType) -> ir::IrType {
+    match kind {
+        ir::IrType::Float32Array => ir::IrType::F32,
+        ir::IrType::Float64Array => ir::IrType::F64,
+        _ => ir::IrType::Number,
+    }
+}
+fn promote_to(a: ir::IrType, b: ir::IrType) -> ir::IrType {
+    if a == ir::IrType::F32 && b == ir::IrType::F32 { ir::IrType::F32 }
+    else if is_float(a) || is_float(b) { ir::IrType::F64 }
+    else { ir::IrType::Number }
+}
+fn coerce(b: &mut FunctionBuilder, val: Value, src: ir::IrType, dst: ir::IrType) -> Value {
+    use ir::IrType::*;
+    match (src, dst) {
+        (Number, F32) => b.ins().fcvt_from_sint(types::F32, val),
+        (Number, F64) => b.ins().fcvt_from_sint(types::F64, val),
+        (F32, F64) => b.ins().fpromote(types::F64, val),
+        (F64, F32) => b.ins().fdemote(types::F32, val),
+        _ => val,
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Capture { name: String, ty: ir::IrType, mutable: bool }
@@ -32,8 +63,8 @@ pub(crate) struct Compiler {
     active_kinds: HashMap<String, ir::IrType>, active_cells: HashSet<String>,
     cell_vars: HashMap<String, Variable>, current_func: String,
     closure_index: HashMap<String, usize>,
-    print_i64: FuncId, print_bool: FuncId, print_str: FuncId,
-    array_new: FuncId, array_get: FuncId, array_set: FuncId, concat_str: FuncId,
+    print_i64: FuncId, print_bool: FuncId, print_str: FuncId, print_f64: FuncId, print_f32: FuncId,
+    array_new: FuncId, array_get: FuncId, array_set: FuncId, array_get_f32: FuncId, array_set_f32: FuncId, concat_str: FuncId,
     env_new: FuncId, env_get: FuncId, env_set: FuncId,
     cell_new: FuncId, cell_get: FuncId, cell_set: FuncId,
     closure_new: FuncId, closure_call: FuncId,
@@ -50,6 +81,11 @@ pub(crate) struct Compiler {
     strings: HashMap<Vec<u8>, DataId>,
     class_new: FuncId,
     class_defs: HashMap<String, ClassDef>,
+    class_sizes: HashMap<String, usize>,
+    class_offsets: HashMap<String, Vec<usize>>,
+    interface_defs: Vec<InterfaceDecl>,
+    param_types: HashMap<String, Vec<ir::IrType>>,
+    extern_param_types: HashMap<String, Vec<ir::IrType>>,
     extern_funcs: HashMap<String, FuncId>,
     extern_abis: HashMap<String, ExternAbi>,
     extern_rets: HashMap<String, ir::IrType>,
@@ -104,7 +140,12 @@ struct ExternAbi {
     ret: ExternRetAbi,
 }
 impl Compiler {
-    pub(crate) fn new() -> Result<Self, String> { let isa = cranelift_codegen::isa::lookup(target_lexicon::HOST).map_err(|e| e.to_string())?.finish(settings::Flags::new(settings::builder())).map_err(|e| e.to_string())?; let b = ObjectBuilder::new(isa, "nexa", cranelift_module::default_libcall_names()).map_err(|e| e.to_string())?; let m = ObjectModule::new(b); let mut c = Self { m, funcs: HashMap::new(), returns: HashMap::new(), closures: HashMap::new(), closure_defs: HashMap::new(), active_kinds: HashMap::new(), active_cells: HashSet::new(), cell_vars: HashMap::new(), current_func: String::new(), closure_index: HashMap::new(), print_i64: FuncId::from_u32(0), print_bool: FuncId::from_u32(0), print_str: FuncId::from_u32(0), array_new: FuncId::from_u32(0), array_get: FuncId::from_u32(0), array_set: FuncId::from_u32(0), concat_str: FuncId::from_u32(0), env_new: FuncId::from_u32(0), env_get: FuncId::from_u32(0), env_set: FuncId::from_u32(0), cell_new: FuncId::from_u32(0), cell_get: FuncId::from_u32(0), cell_set: FuncId::from_u32(0), closure_new: FuncId::from_u32(0), closure_call: FuncId::from_u32(0), stdin_line: FuncId::from_u32(0), parse_number: FuncId::from_u32(0), from_cstring: FuncId::from_u32(0), str_eq: FuncId::from_u32(0), strlen: FuncId::from_u32(0), char_at: FuncId::from_u32(0), net_sockaddr_in: FuncId::from_u32(0), net_socket: FuncId::from_u32(0), net_bind: FuncId::from_u32(0), net_listen: FuncId::from_u32(0), net_accept: FuncId::from_u32(0), net_recv: FuncId::from_u32(0), net_send: FuncId::from_u32(0), net_close: FuncId::from_u32(0), proc_fork: FuncId::from_u32(0), proc_exec1: FuncId::from_u32(0), proc_exec2: FuncId::from_u32(0), proc_pipe: FuncId::from_u32(0), proc_pipe_read: FuncId::from_u32(0), proc_pipe_write: FuncId::from_u32(0), proc_wait: FuncId::from_u32(0), proc_exit: FuncId::from_u32(0), strings: HashMap::new(), class_new: FuncId::from_u32(0), class_defs: HashMap::new(), extern_funcs: HashMap::new(), extern_abis: HashMap::new(), extern_rets: HashMap::new(), globals: HashMap::new() }; c.print_i64 = c.import("nexa_print_i64", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.print_bool = c.import("nexa_print_bool", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.print_str = c.import("nexa_print_str", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.array_new = c.import("nexa_array_new", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.array_get = c.import("nexa_array_get", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.array_set = c.import("nexa_array_set", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.concat_str = c.import("nexa_concat_str", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.env_new = c.import("nexa_env_new", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.env_get = c.import("nexa_env_get", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.env_set = c.import("nexa_env_set", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.cell_new = c.import("nexa_cell_new", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.cell_get = c.import("nexa_cell_get", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.cell_set = c.import("nexa_cell_set", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.closure_new = c.import("nexa_closure_new", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.closure_call = c.import("nexa_closure_call", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.stdin_line = c.import("nexa_stdin_line", vec![], vec![AbiParam::new(types::I64)])?; c.parse_number = c.import("nexa_std_parse_number", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.from_cstring = c.import("nexa_from_cstring", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.str_eq = c.import("nexa_str_eq", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.strlen = c.import("nexa_strlen", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.char_at = c.import("nexa_char_at", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_sockaddr_in = c.import("nexa_net_sockaddr_in", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_socket = c.import("nexa_net_socket", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_bind = c.import("nexa_net_bind", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_listen = c.import("nexa_net_listen", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_accept = c.import("nexa_net_accept", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_recv = c.import("nexa_net_recv", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_send = c.import("nexa_net_send", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_close = c.import("nexa_net_close", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_fork = c.import("nexa_process_fork", vec![], vec![AbiParam::new(types::I64)])?; c.proc_exec1 = c.import("nexa_process_exec1", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_exec2 = c.import("nexa_process_exec2", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_pipe = c.import("nexa_process_pipe", vec![], vec![AbiParam::new(types::I64)])?; c.proc_pipe_read = c.import("nexa_process_pipe_read", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_pipe_write = c.import("nexa_process_pipe_write", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_wait = c.import("nexa_process_wait", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_exit = c.import("nexa_process_exit", vec![AbiParam::new(types::I64)], vec![])?; c.class_new = c.import("nexa_class_new", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; Ok(c) }
+    pub(crate) fn new() -> Result<Self, String> { let isa = cranelift_codegen::isa::lookup(target_lexicon::HOST).map_err(|e| e.to_string())?.finish(settings::Flags::new(settings::builder())).map_err(|e| e.to_string())?; let b = ObjectBuilder::new(isa, "nexa", cranelift_module::default_libcall_names()).map_err(|e| e.to_string())?; let m = ObjectModule::new(b); let mut c = Self { m, funcs: HashMap::new(), returns: HashMap::new(), closures: HashMap::new(), closure_defs: HashMap::new(), active_kinds: HashMap::new(), active_cells: HashSet::new(), cell_vars: HashMap::new(), current_func: String::new(), closure_index: HashMap::new(), print_i64: FuncId::from_u32(0), print_bool: FuncId::from_u32(0), print_str: FuncId::from_u32(0), print_f64: FuncId::from_u32(0), print_f32: FuncId::from_u32(0), array_new: FuncId::from_u32(0), array_get: FuncId::from_u32(0), array_set: FuncId::from_u32(0), array_get_f32: FuncId::from_u32(0), array_set_f32: FuncId::from_u32(0), concat_str: FuncId::from_u32(0), env_new: FuncId::from_u32(0), env_get: FuncId::from_u32(0), env_set: FuncId::from_u32(0), cell_new: FuncId::from_u32(0), cell_get: FuncId::from_u32(0), cell_set: FuncId::from_u32(0), closure_new: FuncId::from_u32(0), closure_call: FuncId::from_u32(0), stdin_line: FuncId::from_u32(0), parse_number: FuncId::from_u32(0), from_cstring: FuncId::from_u32(0), str_eq: FuncId::from_u32(0), strlen: FuncId::from_u32(0), char_at: FuncId::from_u32(0), net_sockaddr_in: FuncId::from_u32(0), net_socket: FuncId::from_u32(0), net_bind: FuncId::from_u32(0), net_listen: FuncId::from_u32(0), net_accept: FuncId::from_u32(0), net_recv: FuncId::from_u32(0), net_send: FuncId::from_u32(0), net_close: FuncId::from_u32(0), proc_fork: FuncId::from_u32(0), proc_exec1: FuncId::from_u32(0), proc_exec2: FuncId::from_u32(0), proc_pipe: FuncId::from_u32(0), proc_pipe_read: FuncId::from_u32(0), proc_pipe_write: FuncId::from_u32(0), proc_wait: FuncId::from_u32(0), proc_exit: FuncId::from_u32(0), strings: HashMap::new(), class_new: FuncId::from_u32(0), class_defs: HashMap::new(), extern_funcs: HashMap::new(), extern_abis: HashMap::new(), extern_rets: HashMap::new(), globals: HashMap::new(), class_sizes: HashMap::new(), class_offsets: HashMap::new(), interface_defs: Vec::new(), param_types: HashMap::new(), extern_param_types: HashMap::new() }; c.print_i64 = c.import("nexa_print_i64", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.print_bool = c.import("nexa_print_bool", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.print_str = c.import("nexa_print_str", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.array_new = c.import("nexa_array_new", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.array_get = c.import("nexa_array_get", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.array_set = c.import("nexa_array_set", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?;
+ c.array_get_f32 = c.import("nexa_array_get_f32", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?;
+ c.array_set_f32 = c.import("nexa_array_set_f32", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?;
+ c.print_f64 = c.import("nexa_print_f64", vec![AbiParam::new(types::F64)], vec![AbiParam::new(types::I64)])?;
+ c.print_f32 = c.import("nexa_print_f32", vec![AbiParam::new(types::F32)], vec![AbiParam::new(types::I64)])?;
+ c.concat_str = c.import("nexa_concat_str", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.env_new = c.import("nexa_env_new", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.env_get = c.import("nexa_env_get", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.env_set = c.import("nexa_env_set", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.cell_new = c.import("nexa_cell_new", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.cell_get = c.import("nexa_cell_get", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.cell_set = c.import("nexa_cell_set", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.closure_new = c.import("nexa_closure_new", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.closure_call = c.import("nexa_closure_call", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.stdin_line = c.import("nexa_stdin_line", vec![], vec![AbiParam::new(types::I64)])?; c.parse_number = c.import("nexa_std_parse_number", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.from_cstring = c.import("nexa_from_cstring", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.str_eq = c.import("nexa_str_eq", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.strlen = c.import("nexa_strlen", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.char_at = c.import("nexa_char_at", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_sockaddr_in = c.import("nexa_net_sockaddr_in", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_socket = c.import("nexa_net_socket", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_bind = c.import("nexa_net_bind", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_listen = c.import("nexa_net_listen", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_accept = c.import("nexa_net_accept", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_recv = c.import("nexa_net_recv", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_send = c.import("nexa_net_send", vec![AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.net_close = c.import("nexa_net_close", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_fork = c.import("nexa_process_fork", vec![], vec![AbiParam::new(types::I64)])?; c.proc_exec1 = c.import("nexa_process_exec1", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_exec2 = c.import("nexa_process_exec2", vec![AbiParam::new(types::I64), AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_pipe = c.import("nexa_process_pipe", vec![], vec![AbiParam::new(types::I64)])?; c.proc_pipe_read = c.import("nexa_process_pipe_read", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_pipe_write = c.import("nexa_process_pipe_write", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_wait = c.import("nexa_process_wait", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; c.proc_exit = c.import("nexa_process_exit", vec![AbiParam::new(types::I64)], vec![])?; c.class_new = c.import("nexa_class_new", vec![AbiParam::new(types::I64)], vec![AbiParam::new(types::I64)])?; Ok(c) }
     fn import(&mut self, n: &str, params: Vec<AbiParam>, returns: Vec<AbiParam>) -> Result<FuncId, String> { let mut s = Signature::new(self.m.isa().default_call_conv()); s.params = params; s.returns = returns; self.m.declare_function(n, Linkage::Import, &s).map_err(|e| e.to_string()) }
     /// Populate `class_defs` from the parsed class declarations. Called before
     /// `declare_externs` so struct (class) params/returns can be sized for the
@@ -112,6 +153,8 @@ impl Compiler {
     /// maps are always consistent with what codegen emits.
     pub(crate) fn register_class_layouts(&mut self, classes: &[ClassDecl]) -> Result<(), String> {
         self.class_defs.clear();
+        self.class_sizes.clear();
+        self.class_offsets.clear();
         for c in classes {
             self.class_defs.insert(c.name.clone(), ClassDef {
                 name: c.name.clone(),
@@ -119,6 +162,59 @@ impl Compiler {
                 constructor_name: c.constructor.name.clone(),
                 method_names: c.methods.iter().map(|m| m.name.clone()).collect(),
             });
+            // Field layout: number/boolean/f64 -> 8-byte slot aligned 8;
+            // f32 -> 4-byte slot aligned 4; instance size aligned to 8.
+            let mut offs = Vec::with_capacity(c.fields.len());
+            let mut off = 0usize;
+            for (_, t) in &c.fields {
+                match t {
+                    ir::IrType::F32 => {
+                        if off % 4 != 0 { off += 4 - (off % 4); }
+                        offs.push(off);
+                        off += 4;
+                    }
+                    _ => {
+                        if off % 8 != 0 { off += 8 - (off % 8); }
+                        offs.push(off);
+                        off += 8;
+                    }
+                }
+            }
+            if off % 8 != 0 { off += 8 - (off % 8); }
+            self.class_offsets.insert(c.name.clone(), offs);
+            self.class_sizes.insert(c.name.clone(), off);
+        }
+        Ok(())
+    }
+    /// Registers the compile-time layout of each `interface` as a class-like
+    /// struct under the interface's own name (`IrType::Class(name)`). Interface
+    /// fields are restricted to number/boolean/string/Pointer, so every field
+    /// is a single 8-byte slot at `index * 8`. The checker guarantees that a
+    /// class satisfying an interface declares the shared fields in the same
+    /// order, so field access through an interface-typed value lands on the
+    /// same offsets as the concrete class instance.
+    pub(crate) fn register_interface_layouts(&mut self, interfaces: &[InterfaceDecl]) -> Result<(), String> {
+        self.interface_defs = interfaces.to_vec();
+        for i in interfaces {
+            if self.class_defs.contains_key(&i.name) {
+                return Err(format!("duplicate top-level declaration `{}` (a class of the same name already exists)", i.name));
+            }
+            let mut offsets = Vec::with_capacity(i.fields.len());
+            for (idx, (_, t)) in i.fields.iter().enumerate() {
+                if !matches!(t, ir::IrType::Number | ir::IrType::Boolean | ir::IrType::String | ir::IrType::Pointer) {
+                    return Err(format!("interface field must be number, boolean, string, or Pointer; got {t:?}"));
+                }
+                offsets.push(idx * 8);
+            }
+            let size = i.fields.len() * 8;
+            self.class_defs.insert(i.name.clone(), ClassDef {
+                name: i.name.clone(),
+                fields: i.fields.iter().map(|(n, t)| (n.clone(), *t)).collect(),
+                constructor_name: String::new(),
+                method_names: Vec::new(),
+            });
+            self.class_offsets.insert(i.name.clone(), offsets);
+            self.class_sizes.insert(i.name.clone(), size);
         }
         Ok(())
     }
@@ -128,8 +224,9 @@ impl Compiler {
             if !matches!(fty, ir::IrType::Number | ir::IrType::Boolean) {
                 return Err(format!(
                     "extern-by-value struct {name} has non-integer field `{fname}` ({fty:?}); \
-                     this version supports only number/boolean fields (each one full 8-byte slot) \
-                     across the System V by-value ABI"
+                     by-value struct ABI requires every field to be a single 8-byte slot. \
+                     f32/f64 fields across the extern boundary are the deferred float \
+                     struct ABI (SSE eightbyte classification) and are not yet supported"
                 ));
             }
         }
@@ -163,9 +260,10 @@ impl Compiler {
                     next_gpr = if n > 2 { 1 } else { 0 };
                 }
                 other => {
-                    s.returns.push(AbiParam::new(types::I64));
+                    let t = ir::ty_to_ir(other);
+                    ret_ir = t;
+                    s.returns.push(AbiParam::new(match t { ir::IrType::F32 => types::F32, ir::IrType::F64 => types::F64, _ => types::I64 }));
                     abi.ret = ExternRetAbi::Scalar;
-                    ret_ir = ir::ty_to_ir(other);
                     next_gpr = 0;
                 }
             }
@@ -191,9 +289,12 @@ impl Compiler {
                     }
                     Ty::Void => return Err(format!("extern function {name}: void is only valid as a return type")),
                     _ => {
-                        s.params.push(AbiParam::new(types::I64));
-                        if next_gpr < 6 { next_gpr += 1; }
+                        let t = ir::ty_to_ir(*p);
+                        s.params.push(AbiParam::new(match t { ir::IrType::F32 => types::F32, ir::IrType::F64 => types::F64, _ => types::I64 }));
+                        if matches!(t, ir::IrType::Number | ir::IrType::Boolean) && next_gpr < 6 { next_gpr += 1; }
                         abi.params.push(ExternParamAbi::Scalar);
+                        let t = ir::ty_to_ir(*p);
+                        self.extern_param_types.entry(name.clone()).or_default().push(t);
                     }
                 }
             }
@@ -210,26 +311,30 @@ impl Compiler {
         for g in globals {
             let id = self.m.declare_data(&format!("global_{}", g.name), Linkage::Local, true, false).map_err(|e| e.to_string())?;
             let mut d = DataDescription::new();
-            d.define(vec![0u8; 8].into_boxed_slice());
+            d.define(vec![0u8; if g.ty == ir::IrType::F32 { 4 } else { 8 }].into_boxed_slice());
             self.m.define_data(id, &d).map_err(|e| e.to_string())?;
             self.globals.insert(g.name.clone(), GlobalSlot { data_id: id, ty: g.ty });
         }
         self.prepare_closures(fs)?;
         self.register_class_layouts(classes)?;
+        let interface_defs = self.interface_defs.clone();
+        self.register_interface_layouts(&interface_defs)?;
         for c in classes {
             let mut s = Signature::new(self.m.isa().default_call_conv());
-            s.params = (0..c.constructor.params.len()).map(|_| AbiParam::new(types::I64)).collect();
-            s.returns.push(AbiParam::new(types::I64));
+            s.params = c.constructor.param_types.iter().map(|t| AbiParam::new(ir_val_type(*t))).collect();
+            s.returns.push(AbiParam::new(ir_val_type(c.constructor.return_type)));
             let id = self.m.declare_function(&c.constructor.name, Linkage::Export, &s).map_err(|e| e.to_string())?;
             self.funcs.insert(c.constructor.name.clone(), id);
             self.returns.insert(c.constructor.name.clone(), c.constructor.return_type);
+            self.param_types.insert(c.constructor.name.clone(), c.constructor.param_types.clone());
             for m in &c.methods {
                 let mut s = Signature::new(self.m.isa().default_call_conv());
-                s.params = (0..m.params.len()).map(|_| AbiParam::new(types::I64)).collect();
-                s.returns.push(AbiParam::new(types::I64));
+                s.params = m.param_types.iter().map(|t| AbiParam::new(ir_val_type(*t))).collect();
+                s.returns.push(AbiParam::new(ir_val_type(m.return_type)));
                 let id = self.m.declare_function(&m.name, Linkage::Export, &s).map_err(|e| e.to_string())?;
                 self.funcs.insert(m.name.clone(), id);
                 self.returns.insert(m.name.clone(), m.return_type);
+                self.param_types.insert(m.name.clone(), m.param_types.clone());
             }
         }
         for f in fs {
@@ -237,11 +342,12 @@ impl Compiler {
                 return Err(format!("Nexa refuses to lower function {} with an unresolved Any or TParam type", f.name));
             }
             let mut s = Signature::new(self.m.isa().default_call_conv());
-            s.params = (0..f.params.len()).map(|_| AbiParam::new(types::I64)).collect();
-            s.returns.push(AbiParam::new(types::I64));
+            s.params = f.param_types.iter().map(|t| AbiParam::new(ir_val_type(*t))).collect();
+            s.returns.push(AbiParam::new(ir_val_type(f.return_type)));
             let id = self.m.declare_function(&f.name, Linkage::Export, &s).map_err(|e| e.to_string())?;
             self.funcs.insert(f.name.clone(), id);
             self.returns.insert(f.name.clone(), f.return_type);
+            self.param_types.insert(f.name.clone(), f.param_types.clone());
         }
         for defs in self.closure_defs.values() {
             for def in defs {
@@ -277,11 +383,11 @@ impl Compiler {
         Ok(())
     }
     fn one_closure(&mut self, def: &ClosureDef) -> Result<(), String> { self.current_func = def.parent.clone(); let id = self.closures[&def.name]; let mut fun = Function::new(); let mut sig = Signature::new(self.m.isa().default_call_conv()); sig.params.push(AbiParam::new(types::I64)); sig.returns.push(AbiParam::new(types::I64)); fun.signature = sig; let mut cx = FunctionBuilderContext::new(); let mut b = FunctionBuilder::new(&mut fun, &mut cx); let entry = b.create_block(); b.append_block_params_for_function_params(entry); b.switch_to_block(entry); self.active_kinds.clear(); self.active_cells.clear(); self.cell_vars.clear(); let env = b.block_params(entry)[0]; let mut vars = HashMap::new(); for (slot, capture) in def.captures.iter().enumerate() { let v = b.declare_var(types::I64); let slot_value = b.ins().iconst(types::I64, slot as i64); let getter = self.m.declare_func_in_func(self.env_get, b.func); let call = b.ins().call(getter, &[env, slot_value]); let raw = b.func.dfg.inst_results(call)[0]; let value = if capture.mutable { let cell_var = b.declare_var(types::I64); b.def_var(cell_var, raw); self.cell_vars.insert(capture.name.clone(), cell_var); let cell_getter = self.m.declare_func_in_func(self.cell_get, b.func); let cell_call = b.ins().call(cell_getter, &[raw]); b.func.dfg.inst_results(cell_call)[0] } else { raw }; b.def_var(v, value); vars.insert(capture.name.clone(), v); self.active_kinds.insert(capture.name.clone(), capture.ty); if capture.mutable { self.active_cells.insert(capture.name.clone()); } } let terminated = self.stmts(&mut b, &def.body, &mut vars)?; if !terminated { let z = b.ins().iconst(types::I64, 0); b.ins().return_(&[z]); } b.seal_all_blocks(); b.finalize(); let mut ctx = cranelift_codegen::Context::for_function(fun); self.m.define_function(id, &mut ctx).map_err(|e| format!("{e:?}"))?; Ok(()) }
-    fn one(&mut self, f: &Fun) -> Result<(), String> { self.current_func = f.name.clone(); let id = self.funcs[&f.name]; let mut fun = Function::new(); let mut sig = Signature::new(self.m.isa().default_call_conv()); sig.params = (0..f.params.len()).map(|_| AbiParam::new(types::I64)).collect(); sig.returns.push(AbiParam::new(types::I64)); fun.signature = sig; let mut cx = FunctionBuilderContext::new(); let mut b = FunctionBuilder::new(&mut fun, &mut cx); let entry = b.create_block(); b.append_block_params_for_function_params(entry); b.switch_to_block(entry); self.active_kinds.clear(); self.active_cells.clear(); self.cell_vars.clear(); let mut vars = HashMap::new(); for (i, n) in f.params.iter().enumerate() { let v = b.declare_var(types::I64); b.def_var(v, b.block_params(entry)[i]); vars.insert(n.clone(), v); self.active_kinds.insert(n.clone(), f.param_types.get(i).copied().unwrap_or(ir::IrType::Any)); } let terminated = self.stmts(&mut b, &f.body, &mut vars)?; if !terminated { let z = b.ins().iconst(types::I64, 0); b.ins().return_(&[z]); } b.seal_all_blocks(); b.finalize(); let mut ctx = cranelift_codegen::Context::for_function(fun); self.m.define_function(id, &mut ctx).map_err(|e| format!("{e:?}"))?; Ok(()) }
+    fn one(&mut self, f: &Fun) -> Result<(), String> { self.current_func = f.name.clone(); let id = self.funcs[&f.name]; let mut fun = Function::new(); let mut sig = Signature::new(self.m.isa().default_call_conv()); sig.params = f.param_types.iter().map(|t| AbiParam::new(ir_val_type(*t))).collect(); sig.returns.push(AbiParam::new(ir_val_type(f.return_type))); fun.signature = sig; let mut cx = FunctionBuilderContext::new(); let mut b = FunctionBuilder::new(&mut fun, &mut cx); let entry = b.create_block(); b.append_block_params_for_function_params(entry); b.switch_to_block(entry); self.active_kinds.clear(); self.active_cells.clear(); self.cell_vars.clear(); let mut vars = HashMap::new(); for (i, n) in f.params.iter().enumerate() { let t = f.param_types.get(i).copied().unwrap_or(ir::IrType::Any); let v = b.declare_var(ir_val_type(t)); b.def_var(v, b.block_params(entry)[i]); vars.insert(n.clone(), v); self.active_kinds.insert(n.clone(), t); } let terminated = self.stmts(&mut b, &f.body, &mut vars)?; if !terminated { let z = match f.return_type { ir::IrType::F64 => b.ins().f64const(0.0), ir::IrType::F32 => b.ins().f32const(0.0), _ => b.ins().iconst(types::I64, 0) }; b.ins().return_(&[z]); } b.seal_all_blocks(); b.finalize(); let mut ctx = cranelift_codegen::Context::for_function(fun); self.m.define_function(id, &mut ctx).map_err(|e| format!("{e:?}"))?; Ok(()) }
     fn stmts(&mut self, b: &mut FunctionBuilder, ss: &[Stmt], vars: &mut HashMap<String, Variable>) -> Result<bool, String> { for s in ss { if self.stmt(b, s, vars)? { return Ok(true); } } Ok(false) }
     fn stmt(&mut self, b: &mut FunctionBuilder, s: &Stmt, vars: &mut HashMap<String, Variable>) -> Result<bool, String> { match s {
-        Stmt::Let(n, annotation, e) => { let v = b.declare_var(types::I64); let x = self.emit(b, e, vars)?; b.def_var(v, x); vars.insert(n.clone(), v); self.active_kinds.insert(n.clone(), annotation.unwrap_or_else(|| self.expr_kind(e))); Ok(false) }
-        Stmt::Assign(n, e) => { let x = self.emit(b, e, vars)?; if let Some(slot) = self.globals.get(n) { let gv = self.m.declare_data_in_func(slot.data_id, b.func); let addr = b.ins().symbol_value(types::I64, gv); b.ins().store(MemFlags::new(), x, addr, 0); } else { let v = *vars.get(n).ok_or_else(|| format!("unknown variable {n}"))?; b.def_var(v, x); if let Some(&cell_var) = self.cell_vars.get(n) { let cell_ptr = b.use_var(cell_var); let callee = self.m.declare_func_in_func(self.cell_set, b.func); b.ins().call(callee, &[cell_ptr, x]); } } Ok(false) }
+        Stmt::Let(n, annotation, e) => { let kind = annotation.unwrap_or_else(|| self.expr_kind(e)); let v = b.declare_var(ir_val_type(kind)); let x = self.emit(b, e, vars)?; let x = coerce(b, x, self.expr_kind(e), kind); b.def_var(v, x); vars.insert(n.clone(), v); self.active_kinds.insert(n.clone(), kind); Ok(false) }
+        Stmt::Assign(n, e) => { let x = self.emit(b, e, vars)?; if let Some(slot) = self.globals.get(n) { let x = coerce(b, x, self.expr_kind(e), slot.ty); let gv = self.m.declare_data_in_func(slot.data_id, b.func); let addr = b.ins().symbol_value(types::I64, gv); b.ins().store(MemFlags::new(), x, addr, 0); } else { let v = *vars.get(n).ok_or_else(|| format!("unknown variable {n}"))?; let kind = self.active_kinds.get(n).copied().unwrap_or(ir::IrType::Number); let x = coerce(b, x, self.expr_kind(e), kind); b.def_var(v, x); if let Some(&cell_var) = self.cell_vars.get(n) { let cell_ptr = b.use_var(cell_var); let callee = self.m.declare_func_in_func(self.cell_set, b.func); b.ins().call(callee, &[cell_ptr, x]); } } Ok(false) }
         Stmt::FieldAssign(obj, field, e) => {
             let obj_val = self.emit(b, obj, vars)?;
             let value = self.emit(b, e, vars)?;
@@ -292,14 +398,15 @@ impl Compiler {
                 _ => None,
             }.ok_or_else(|| "field assignment on non-class object".to_string())?;
             let cls = self.class_defs.get(cls_name).ok_or_else(|| format!("unknown class {cls_name}"))?;
-            let (field_idx, _) = cls.fields.iter().enumerate().find(|(_, (n, _))| n == field).ok_or_else(|| format!("unknown field {field}"))?;
-            let offset = b.ins().iconst(types::I64, (field_idx * 8) as i64);
+            let (field_idx, (_, field_ty)) = cls.fields.iter().enumerate().find(|(_, (n, _))| n == field).ok_or_else(|| format!("unknown field {field}"))?;
+            let value = coerce(b, value, self.expr_kind(e), *field_ty);
+            let offset = b.ins().iconst(types::I64, self.class_offsets.get(cls_name).and_then(|o| o.get(field_idx)).copied().unwrap_or(field_idx * 8) as i64);
             let ptr = b.ins().iadd(obj_val, offset);
             b.ins().store(MemFlags::new(), value, ptr, 0);
             Ok(false)
         }
-        Stmt::IndexAssign(a, i, e) => { let array = self.emit(b, a, vars)?; let index = self.emit(b, i, vars)?; let value = self.emit(b, e, vars)?; let callee = self.m.declare_func_in_func(self.array_set, b.func); b.ins().call(callee, &[array, index, value]); Ok(false) }
-        Stmt::Return(e) => { let x = self.emit(b, e, vars)?; b.ins().return_(&[x]); Ok(true) }
+        Stmt::IndexAssign(a, i, e) => { let array = self.emit(b, a, vars)?; let index = self.emit(b, i, vars)?; let value = self.emit(b, e, vars)?; let elem_kind = array_elem_kind(self.expr_kind(a)); let value = coerce(b, value, self.expr_kind(e), elem_kind); match elem_kind { ir::IrType::F32 => { let lo = b.ins().bitcast(types::I32, MemFlags::new(), value); let wide = b.ins().uextend(types::I64, lo); let callee = self.m.declare_func_in_func(self.array_set_f32, b.func); b.ins().call(callee, &[array, index, wide]); }, ir::IrType::F64 => { let wide = b.ins().bitcast(types::I64, MemFlags::new(), value); let callee = self.m.declare_func_in_func(self.array_set, b.func); b.ins().call(callee, &[array, index, wide]); }, _ => { let callee = self.m.declare_func_in_func(self.array_set, b.func); b.ins().call(callee, &[array, index, value]); } } Ok(false) }
+        Stmt::Return(e) => { let x = self.emit(b, e, vars)?; let expected = self.returns.get(&self.current_func).copied().unwrap_or(ir::IrType::Void); let x = coerce(b, x, self.expr_kind(e), expected); b.ins().return_(&[x]); Ok(true) }
         Stmt::Expr(e) => { self.emit(b, e, vars)?; Ok(false) }
         Stmt::Block(body) => self.stmts(b, body, vars),
         Stmt::If(c, yes, no) => { let t = b.create_block(); let f = b.create_block(); let join = b.create_block(); let x = self.emit(b, c, vars)?; b.ins().brif(x, t, &[], f, &[]); b.switch_to_block(t); let yt = self.stmts(b, yes, vars)?; if !yt { b.ins().jump(join, &[]); } b.switch_to_block(f); let ft = self.stmts(b, no, vars)?; if !ft { b.ins().jump(join, &[]); } b.switch_to_block(join); b.seal_block(t); b.seal_block(f); b.seal_block(join); Ok(yt && ft) }
@@ -325,7 +432,7 @@ impl Compiler {
             let update = Stmt::Assign(i_var.clone(), step1);
             let kind = self.expr_kind(iter);
             let (cond, elem) = match kind {
-                ir::IrType::NumberArray => {
+                ir::IrType::NumberArray | ir::IrType::Float32Array | ir::IrType::Float64Array => {
                     let len = Expr::FieldAccess(Box::new(first.clone()), "length".to_string());
                     let cond = Expr::Bin(Box::new(i_ref.clone()), "<".to_string(), Box::new(len));
                     let elem = Expr::Index(Box::new(first), Box::new(i_ref));
@@ -337,16 +444,16 @@ impl Compiler {
                     let elem = Expr::Call("std.charAt".to_string(), vec![first, i_ref]);
                     (cond, elem)
                 }
-                other => return Err(format!("cannot iterate over a value of type {other:?}; only number[] and string are iterable")),
+                other => return Err(format!("cannot iterate over a value of type {other:?}; only number[], f32[], f64[], and string are iterable")),
             };
-            let binder_ty = if kind == ir::IrType::NumberArray { Some(ir::IrType::Number) } else { Some(ir::IrType::String) };
+            let binder_ty = match kind { ir::IrType::NumberArray => Some(ir::IrType::Number), ir::IrType::Float32Array => Some(ir::IrType::F32), ir::IrType::Float64Array => Some(ir::IrType::F64), _ => Some(ir::IrType::String) };
             let mut wrapped = vec![Stmt::Let(binder.clone(), binder_ty, elem)];
             wrapped.extend(body.iter().cloned());
             let desugared = Stmt::For(Box::new(init), cond, Box::new(update), wrapped);
             self.stmt(b, &desugared, vars)
         }
     } }
-    fn expr_kind(&self, e: &Expr) -> ir::IrType { match e { Expr::Num(_) => ir::IrType::Number, Expr::Bool(_) => ir::IrType::Boolean, Expr::Str(_) => ir::IrType::String, Expr::Array(_) => ir::IrType::NumberArray, Expr::Closure(_) => ir::IrType::ClosureNumber, Expr::Index(_, _) => ir::IrType::Number, Expr::New(name, _) => ir::IrType::Class(leak_str(name)), Expr::FieldAccess(obj, field) => {
+    fn expr_kind(&self, e: &Expr) -> ir::IrType { match e { Expr::Num(_) => ir::IrType::Number, Expr::FNum(_) => ir::IrType::F64, Expr::Bool(_) => ir::IrType::Boolean, Expr::Str(_) => ir::IrType::String, Expr::Array(_) => ir::IrType::NumberArray, Expr::Closure(_) => ir::IrType::ClosureNumber, Expr::Index(a, _) => array_elem_kind(self.expr_kind(a)), Expr::New(name, _) => if name == "Array" { ir::IrType::NumberArray } else { ir::IrType::Class(leak_str(name)) }, Expr::ObjectLiteral(name, _) => ir::IrType::Class(leak_str(name)), Expr::FieldAccess(obj, field) => {
             if let Expr::Var(n) = obj.as_ref() {
                 if let Some(ir::IrType::Class(cls_name)) = self.active_kinds.get(n) {
                     if let Some(cls) = self.class_defs.get(*cls_name) {
@@ -369,14 +476,34 @@ impl Compiler {
             }
             ir::IrType::Number
         }
-        Expr::Var(n) => self.globals.get(n).map(|s| s.ty).unwrap_or_else(|| self.active_kinds.get(n).copied().unwrap_or(ir::IrType::Any)), Expr::Unary(op, _) => if *op == '!' { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Bin(a, op, c) => if op == "+" && self.expr_kind(a) == ir::IrType::String && self.expr_kind(c) == ir::IrType::String { ir::IrType::String } else if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||") { ir::IrType::Boolean } else { ir::IrType::Number }, Expr::Call(n, _) | Expr::CallGeneric(n, _, _) => if let Some(op) = stdlib::StdOp::of(n) { op.ir_type() } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { ir::IrType::Number } else if let Some(t) = self.extern_rets.get(n) { *t } else { self.returns.get(n).copied().unwrap_or(ir::IrType::Any) } } }
+        Expr::Var(n) => self.globals.get(n).map(|s| s.ty).unwrap_or_else(|| self.active_kinds.get(n).copied().unwrap_or(ir::IrType::Any)), Expr::Unary(op, x) => if *op == '!' { ir::IrType::Boolean } else { self.expr_kind(x) }, Expr::Bin(a, op, c) => { let ka = self.expr_kind(a); let kc = self.expr_kind(c); if op == "+" && ka == ir::IrType::String && kc == ir::IrType::String { ir::IrType::String } else if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||") { ir::IrType::Boolean } else { promote_to(ka, kc) } }, Expr::Call(n, _) | Expr::CallGeneric(n, _, _) => if let Some(op) = stdlib::StdOp::of(n) { op.ir_type() } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { ir::IrType::Number } else if let Some(t) = self.extern_rets.get(n) { *t } else { self.returns.get(n).copied().unwrap_or(ir::IrType::Any) } } }
+    /// Registers the per-site layout for an object literal (a synthesized
+    /// struct whose field order = the literal's own field order, each field a
+    /// single 8-byte slot). The checker guarantees the literal's fields line
+    /// up with the expected interface's offsets, so reads through an
+    /// interface-typed value later land on the same offsets.
+    fn register_object_literal_layout(&mut self, name: &str, fields: &[(String, Expr)]) -> Result<(), String> {
+        if self.class_defs.contains_key(name) { return Ok(()); }
+        let mut offsets = Vec::with_capacity(fields.len());
+        for (i, (_, value)) in fields.iter().enumerate() {
+            let fty = self.expr_kind(value);
+            if !matches!(fty, ir::IrType::Number | ir::IrType::Boolean | ir::IrType::String | ir::IrType::Pointer) {
+                return Err(format!("object literal field must be number, boolean, string, or Pointer; got {fty:?}"));
+            }
+            offsets.push(i * 8);
+        }
+        let defs_fields = fields.iter().map(|(n, v)| (n.clone(), self.expr_kind(v))).collect();
+        self.class_defs.insert(name.to_string(), ClassDef { name: name.to_string(), fields: defs_fields, constructor_name: String::new(), method_names: Vec::new() });
+        self.class_offsets.insert(name.to_string(), offsets);
+        self.class_sizes.insert(name.to_string(), fields.len() * 8);
+        Ok(())
+    }
     /// Allocate a fresh, zeroed class instance for `class_name` (a calloc'd
     /// contiguous block of `field_count * 8` bytes): the runtime representation
     /// that doubles as the by-value struct storage at the extern boundary.
     fn alloc_instance(&mut self, b: &mut FunctionBuilder, class_name: &str) -> Result<Value, String> {
         let cls = self.class_defs.get(class_name).ok_or_else(|| format!("unknown class {class_name}"))?;
-        let field_count = cls.fields.len() as i64;
-        let size = b.ins().iconst(types::I64, field_count * 8);
+        let size = b.ins().iconst(types::I64, self.class_sizes.get(class_name).copied().unwrap_or(cls.fields.len() * 8) as i64);
         let callee = self.m.declare_func_in_func(self.class_new, b.func);
         let call = b.ins().call(callee, &[size]);
         Ok(b.func.dfg.inst_results(call)[0])
@@ -401,7 +528,11 @@ impl Compiler {
         }
         for (i, e) in args.iter().enumerate() {
             match abi.params[i] {
-                ExternParamAbi::Scalar => xs.push(self.emit(b, e, vars)?),
+                ExternParamAbi::Scalar => {
+                    let x = self.emit(b, e, vars)?;
+                    let dst = self.extern_param_types.get(name).and_then(|pts| pts.get(i)).copied().unwrap_or(ir::IrType::Number);
+                    xs.push(coerce(b, x, self.expr_kind(e), dst));
+                }
                 ExternParamAbi::StructRegs(n) => {
                     let ptr = self.emit(b, e, vars)?;
                     for f in 0..n {
@@ -432,10 +563,10 @@ impl Compiler {
         }
     }
     fn emit(&mut self, b: &mut FunctionBuilder, e: &Expr, vars: &HashMap<String, Variable>) -> Result<Value, String> { match e {
-        Expr::Num(x) => Ok(b.ins().iconst(types::I64, *x)), Expr::Bool(x) => Ok(b.ins().iconst(types::I64, i64::from(*x))), Expr::Array(elems) => { let callee_new = self.m.declare_func_in_func(self.array_new, b.func); let n = b.ins().iconst(types::I64, elems.len() as i64); let call = b.ins().call(callee_new, &[n]); let arr = b.func.dfg.inst_results(call)[0]; let callee_set = self.m.declare_func_in_func(self.array_set, b.func); for (i, e) in elems.iter().enumerate() { let val = self.emit(b, e, vars)?; let idx = b.ins().iconst(types::I64, i as i64); b.ins().call(callee_set, &[arr, idx, val]); } Ok(arr) }, Expr::Index(a, i) => { let array = self.emit(b, a, vars)?; let index = self.emit(b, i, vars)?; let callee = self.m.declare_func_in_func(self.array_get, b.func); let call = b.ins().call(callee, &[array, index]); Ok(b.func.dfg.inst_results(call)[0]) }, Expr::Var(n) => { if let Some(slot) = self.globals.get(n) { let gv = self.m.declare_data_in_func(slot.data_id, b.func); let addr = b.ins().symbol_value(types::I64, gv); Ok(b.ins().load(types::I64, MemFlags::new(), addr, 0)) } else { Ok(b.use_var(*vars.get(n).ok_or_else(|| format!("unknown variable {n}"))?)) } },
+        Expr::Num(x) => Ok(b.ins().iconst(types::I64, *x)), Expr::FNum(x) => Ok(b.ins().f64const(*x)), Expr::Bool(x) => Ok(b.ins().iconst(types::I64, i64::from(*x))), Expr::Array(elems) => { let callee_new = self.m.declare_func_in_func(self.array_new, b.func); let n = b.ins().iconst(types::I64, elems.len() as i64); let call = b.ins().call(callee_new, &[n]); let arr = b.func.dfg.inst_results(call)[0]; let callee_set = self.m.declare_func_in_func(self.array_set, b.func); for (i, e) in elems.iter().enumerate() { let val = self.emit(b, e, vars)?; let idx = b.ins().iconst(types::I64, i as i64); b.ins().call(callee_set, &[arr, idx, val]); } Ok(arr) }, Expr::Index(a, i) => { let array = self.emit(b, a, vars)?; let index = self.emit(b, i, vars)?; let elem_kind = array_elem_kind(self.expr_kind(a)); let callee_id = if elem_kind == ir::IrType::F32 { self.array_get_f32 } else { self.array_get }; let callee = self.m.declare_func_in_func(callee_id, b.func); let call = b.ins().call(callee, &[array, index]); let raw = b.func.dfg.inst_results(call)[0]; Ok(match elem_kind { ir::IrType::F32 => { let lo = b.ins().ireduce(types::I32, raw); b.ins().bitcast(types::F32, MemFlags::new(), lo) }, ir::IrType::F64 => b.ins().bitcast(types::F64, MemFlags::new(), raw), _ => raw }) }, Expr::Var(n) => { if let Some(slot) = self.globals.get(n) { let gv = self.m.declare_data_in_func(slot.data_id, b.func); let addr = b.ins().symbol_value(types::I64, gv); Ok(b.ins().load(ir_val_type(slot.ty), MemFlags::new(), addr, 0)) } else { Ok(b.use_var(*vars.get(n).ok_or_else(|| format!("unknown variable {n}"))?)) } },
         Expr::New(class_name, args) => {
             if class_name == "Array" {
-                if args.len() != 1 { return Err("new Array<number>(n) requires exactly one size argument".into()); }
+                if args.len() != 1 { return Err("new Array<T>(n) requires exactly one size argument".into()); }
                 let n = self.emit(b, &args[0], vars)?;
                 let callee = self.m.declare_func_in_func(self.array_new, b.func);
                 let call = b.ins().call(callee, &[n]);
@@ -446,10 +577,24 @@ impl Compiler {
             let ctor_id = *self.funcs.get(&ctor_name).ok_or_else(|| format!("unknown constructor {ctor_name}"))?;
             let ctor_ref = self.m.declare_func_in_func(ctor_id, b.func);
             let mut ctor_args = vec![ptr];
-            for a in args {
-                ctor_args.push(self.emit(b, a, vars)?);
+            let ctor_params = self.param_types.get(&ctor_name).cloned().unwrap_or_default();
+            for (i, a) in args.iter().enumerate() {
+                let x = self.emit(b, a, vars)?;
+                let exp = ctor_params.get(i + 1).copied().unwrap_or(ir::IrType::Number);
+                ctor_args.push(coerce(b, x, self.expr_kind(a), exp));
             }
             b.ins().call(ctor_ref, &ctor_args);
+            Ok(ptr)
+        }
+        Expr::ObjectLiteral(synth_name, fields) => {
+            self.register_object_literal_layout(synth_name, fields)?;
+            let ptr = self.alloc_instance(b, synth_name)?;
+            for (i, (_, value)) in fields.iter().enumerate() {
+                let val = self.emit(b, value, vars)?;
+                let offset = b.ins().iconst(types::I64, (i as i64) * 8);
+                let field_ptr = b.ins().iadd(ptr, offset);
+                b.ins().store(MemFlags::new(), val, field_ptr, 0);
+            }
             Ok(ptr)
         }
         Expr::FieldAccess(obj, field) => {
@@ -458,7 +603,7 @@ impl Compiler {
                 Expr::Var(n) => self.active_kinds.get(n).copied(),
                 _ => None,
             };
-            if field == "length" && (obj_kind == Some(ir::IrType::NumberArray) || obj_kind.is_none()) {
+            if field == "length" && (matches!(obj_kind, Some(ir::IrType::NumberArray) | Some(ir::IrType::Float32Array) | Some(ir::IrType::Float64Array)) || obj_kind.is_none()) {
                 /* arr.length: read the fixed length header at the single i64
                    immediately preceding the element buffer (array[-1]). */
                 let minus = b.ins().iconst(types::I64, -8);
@@ -467,10 +612,10 @@ impl Compiler {
             }
             let cls_name = obj_kind.and_then(|k| match k { ir::IrType::Class(c) => Some(c), _ => None }).ok_or_else(|| "field access on non-class object".to_string())?;
             let cls = self.class_defs.get(cls_name).ok_or_else(|| format!("unknown class {cls_name}"))?;
-            let (field_idx, _) = cls.fields.iter().enumerate().find(|(_, (n, _))| n == field).ok_or_else(|| format!("unknown field {field}"))?;
-            let offset = b.ins().iconst(types::I64, (field_idx * 8) as i64);
+            let (field_idx, (_, field_ty)) = cls.fields.iter().enumerate().find(|(_, (n, _))| n == field).ok_or_else(|| format!("unknown field {field}"))?;
+            let offset = b.ins().iconst(types::I64, self.class_offsets.get(cls_name).and_then(|o| o.get(field_idx)).copied().unwrap_or(field_idx * 8) as i64);
             let ptr = b.ins().iadd(obj_val, offset);
-            Ok(b.ins().load(types::I64, MemFlags::new(), ptr, 0))
+            Ok(b.ins().load(ir_val_type(*field_ty), MemFlags::new(), ptr, 0))
         }
         Expr::MethodCall(obj, method, args) => {
             let cls_name = match obj.as_ref() {
@@ -481,14 +626,19 @@ impl Compiler {
             let id = *self.funcs.get(&method_name).ok_or_else(|| format!("unknown method {method_name}"))?;
             let obj_val = self.emit(b, obj, vars)?;
             let mut xs = vec![obj_val];
-            for a in args { xs.push(self.emit(b, a, vars)?); }
+            let params = self.param_types.get(&method_name).cloned().unwrap_or_default();
+            for (i, a) in args.iter().enumerate() {
+                let x = self.emit(b, a, vars)?;
+                let exp = params.get(i + 1).copied().unwrap_or(ir::IrType::Number);
+                xs.push(coerce(b, x, self.expr_kind(a), exp));
+            }
             let callee = self.m.declare_func_in_func(id, b.func);
             let call = b.ins().call(callee, &xs);
             Ok(b.func.dfg.inst_results(call)[0])
         }
-        Expr::Unary(op, x) => { let v = self.emit(b, x, vars)?; Ok(if *op == '-' { b.ins().ineg(v) } else { b.ins().icmp_imm(IntCC::Equal, v, 0) }) }
-        Expr::Bin(a, op, c) => { let ta = self.expr_kind(a); let tc = self.expr_kind(c); let string_add = op == "+" && ta == ir::IrType::String && tc == ir::IrType::String; let string_cmp = (op == "==" || op == "!=") && ta == ir::IrType::String && tc == ir::IrType::String; let x = self.emit(b, a, vars)?; let y = self.emit(b, c, vars)?; if string_add { let callee = self.m.declare_func_in_func(self.concat_str, b.func); let call = b.ins().call(callee, &[x, y]); return Ok(b.func.dfg.inst_results(call)[0]); } if string_cmp { /* String == / != must compare CONTENT (length + bytes), not pointer identity. Two strings are equal when their bytes match even if they were built independently (a literal vs. a concat result live at different addresses). nexa_str_eq masks the tag bits, compares lengths, then bytes. */ let callee = self.m.declare_func_in_func(self.str_eq, b.func); let call = b.ins().call(callee, &[x, y]); let eq = b.func.dfg.inst_results(call)[0]; if op == "==" { return Ok(eq); } let nz = b.ins().icmp_imm(IntCC::Equal, eq, 0); return Ok(b.ins().uextend(types::I64, nz)); } let v = match op.as_str() { "+" => b.ins().iadd(x, y), "-" => b.ins().isub(x, y), "*" => b.ins().imul(x, y), "/" => b.ins().sdiv(x, y), "%" => b.ins().srem(x, y), "==" => b.ins().icmp(IntCC::Equal, x, y), "!=" => b.ins().icmp(IntCC::NotEqual, x, y), "<" => b.ins().icmp(IntCC::SignedLessThan, x, y), "<=" => b.ins().icmp(IntCC::SignedLessThanOrEqual, x, y), ">" => b.ins().icmp(IntCC::SignedGreaterThan, x, y), ">=" => b.ins().icmp(IntCC::SignedGreaterThanOrEqual, x, y), "&&" => b.ins().band(x, y), "||" => b.ins().bor(x, y), _ => return Err(format!("unknown operator {op}")) }; let v = if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=") { b.ins().uextend(types::I64, v) } else { v }; Ok(v) }
-        Expr::Call(n, a) | Expr::CallGeneric(n, _, a) => { if let Some(op) = stdlib::StdOp::of(n) { stdlib::emit_std_call(self, b, op, a, vars) } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { let closure_val = b.use_var(*vars.get(n).ok_or_else(|| format!("unknown closure {n}"))?); let callee = self.m.declare_func_in_func(self.closure_call, b.func); let call = b.ins().call(callee, &[closure_val]); Ok(b.func.dfg.inst_results(call)[0]) } else if let Some(&fid) = self.extern_funcs.get(n) { self.emit_extern_call(b, n, fid, a, vars) } else { let id = *self.funcs.get(n).ok_or_else(|| format!("unknown function {n}"))?; let mut xs = Vec::new(); for a in a { xs.push(self.emit(b, a, vars)?); } let callee = self.m.declare_func_in_func(id, b.func); let call = b.ins().call(callee, &xs); Ok(b.func.dfg.inst_results(call)[0]) } }
+        Expr::Unary(op, x) => { let v = self.emit(b, x, vars)?; if *op == '-' { if is_float(self.expr_kind(x)) { Ok(b.ins().fneg(v)) } else { Ok(b.ins().ineg(v)) } } else { Ok(b.ins().icmp_imm(IntCC::Equal, v, 0)) } }
+        Expr::Bin(a, op, c) => { let ta = self.expr_kind(a); let tc = self.expr_kind(c); let string_add = op == "+" && ta == ir::IrType::String && tc == ir::IrType::String; let string_cmp = (op == "==" || op == "!=") && ta == ir::IrType::String && tc == ir::IrType::String; let x = self.emit(b, a, vars)?; let y = self.emit(b, c, vars)?; if string_add { let callee = self.m.declare_func_in_func(self.concat_str, b.func); let call = b.ins().call(callee, &[x, y]); return Ok(b.func.dfg.inst_results(call)[0]); } if string_cmp { /* String == / != must compare CONTENT (length + bytes), not pointer identity. Two strings are equal when their bytes match even if they were built independently (a literal vs. a concat result live at different addresses). nexa_str_eq masks the tag bits, compares lengths, then bytes. */ let callee = self.m.declare_func_in_func(self.str_eq, b.func); let call = b.ins().call(callee, &[x, y]); let eq = b.func.dfg.inst_results(call)[0]; if op == "==" { return Ok(eq); } let nz = b.ins().icmp_imm(IntCC::Equal, eq, 0); return Ok(b.ins().uextend(types::I64, nz)); } let pk = promote_to(ta, tc); let x = coerce(b, x, ta, pk); let y = coerce(b, y, tc, pk); if is_float(pk) { if op == "%" { return Err("modulo (%) is not supported on float operands".into()); } let float_cmp = |b: &mut FunctionBuilder, cc: FloatCC| { let v = b.ins().fcmp(cc, x, y); b.ins().uextend(types::I64, v) }; let v = match op.as_str() { "+" => b.ins().fadd(x, y), "-" => b.ins().fsub(x, y), "*" => b.ins().fmul(x, y), "/" => b.ins().fdiv(x, y), "==" => float_cmp(b, FloatCC::Equal), "!=" => float_cmp(b, FloatCC::NotEqual), "<" => float_cmp(b, FloatCC::LessThan), "<=" => float_cmp(b, FloatCC::LessThanOrEqual), ">" => float_cmp(b, FloatCC::GreaterThan), ">=" => float_cmp(b, FloatCC::GreaterThanOrEqual), _ => return Err(format!("unknown operator {op} for float operands")) }; return Ok(v); } let v = match op.as_str() { "+" => b.ins().iadd(x, y), "-" => b.ins().isub(x, y), "*" => b.ins().imul(x, y), "/" => b.ins().sdiv(x, y), "%" => b.ins().srem(x, y), "==" => b.ins().icmp(IntCC::Equal, x, y), "!=" => b.ins().icmp(IntCC::NotEqual, x, y), "<" => b.ins().icmp(IntCC::SignedLessThan, x, y), "<=" => b.ins().icmp(IntCC::SignedLessThanOrEqual, x, y), ">" => b.ins().icmp(IntCC::SignedGreaterThan, x, y), ">=" => b.ins().icmp(IntCC::SignedGreaterThanOrEqual, x, y), "&&" => b.ins().band(x, y), "||" => b.ins().bor(x, y), _ => return Err(format!("unknown operator {op}")) }; let v = if matches!(op.as_str(), "==" | "!=" | "<" | "<=" | ">" | ">=") { b.ins().uextend(types::I64, v) } else { v }; Ok(v) }
+        Expr::Call(n, a) | Expr::CallGeneric(n, _, a) => { if let Some(op) = stdlib::StdOp::of(n) { stdlib::emit_std_call(self, b, op, a, vars) } else if self.active_kinds.get(n) == Some(&ir::IrType::ClosureNumber) { let closure_val = b.use_var(*vars.get(n).ok_or_else(|| format!("unknown closure {n}"))?); let callee = self.m.declare_func_in_func(self.closure_call, b.func); let call = b.ins().call(callee, &[closure_val]); Ok(b.func.dfg.inst_results(call)[0]) } else if let Some(&fid) = self.extern_funcs.get(n) { self.emit_extern_call(b, n, fid, a, vars) } else { let id = *self.funcs.get(n).ok_or_else(|| format!("unknown function {n}"))?; let params = self.param_types.get(n).cloned().unwrap_or_default(); let mut xs = Vec::new(); for (i, a) in a.iter().enumerate() { let x = self.emit(b, a, vars)?; let exp = params.get(i).copied().unwrap_or(ir::IrType::Number); xs.push(coerce(b, x, self.expr_kind(a), exp)); } let callee = self.m.declare_func_in_func(id, b.func); let call = b.ins().call(callee, &xs); Ok(b.func.dfg.inst_results(call)[0]) } }
         Expr::Str(s) => { let id = if let Some(id) = self.strings.get(s) { *id } else { let id = self.m.declare_data(&format!("str{}", self.strings.len()), Linkage::Local, false, false).map_err(|e| e.to_string())?; let mut d = DataDescription::new(); let mut bytes = Vec::with_capacity(8 + s.len() + 1); bytes.extend_from_slice(&(s.len() as i64).to_ne_bytes()); bytes.extend_from_slice(s); bytes.push(0); d.define(bytes.into_boxed_slice()); self.m.define_data(id, &d).map_err(|e| e.to_string())?; let _ = self.strings.insert(s.clone(), id); id }; let gv = self.m.declare_data_in_func(id, b.func); let p = b.ins().symbol_value(types::I64, gv); let hdr = b.ins().iconst(types::I64, 8); let p = b.ins().iadd(p, hdr); let tag = b.ins().iconst(types::I64, i64::MIN); Ok(b.ins().bor(p, tag)) }
         Expr::Closure(_) => { let defs = self.closure_defs.get(&self.current_func).ok_or_else(|| format!("no closure definitions for {}", self.current_func))?; let idx = *self.closure_index.entry(self.current_func.clone()).or_insert(0); let def = defs.get(idx).ok_or_else(|| format!("closure index {} out of range for {}", idx, self.current_func))?; self.closure_index.insert(self.current_func.clone(), idx + 1); let env_len = b.ins().iconst(types::I64, def.captures.len() as i64); let callee = self.m.declare_func_in_func(self.env_new, b.func); let call = b.ins().call(callee, &[env_len]); let env = b.func.dfg.inst_results(call)[0]; for (slot, capture) in def.captures.iter().enumerate() { let slot_val = b.ins().iconst(types::I64, slot as i64); let value = b.use_var(*vars.get(&capture.name).ok_or_else(|| format!("unknown capture `{}`", capture.name))?); if capture.mutable { let cell_callee = self.m.declare_func_in_func(self.cell_new, b.func); let cell_call = b.ins().call(cell_callee, &[value]); let cell_ptr = b.func.dfg.inst_results(cell_call)[0]; let cell_var = b.declare_var(types::I64); b.def_var(cell_var, cell_ptr); self.cell_vars.insert(capture.name.clone(), cell_var); self.active_cells.insert(capture.name.clone()); let set_callee = self.m.declare_func_in_func(self.env_set, b.func); b.ins().call(set_callee, &[env, slot_val, cell_ptr]); } else { let set_callee = self.m.declare_func_in_func(self.env_set, b.func); b.ins().call(set_callee, &[env, slot_val, value]); } } let func_ref = self.m.declare_func_in_func(self.closures[&def.name], b.func); let code_ptr = b.ins().func_addr(types::I64, func_ref); let new_callee = self.m.declare_func_in_func(self.closure_new, b.func); let call = b.ins().call(new_callee, &[code_ptr, env]); Ok(b.func.dfg.inst_results(call)[0]) }
     } }
@@ -502,11 +652,16 @@ impl stdlib::StdEmitter for Compiler {
     fn expr_is_boolean(&self, e: &Expr) -> bool {
         self.expr_kind(e) == ir::IrType::Boolean
     }
+    fn expr_ir_kind(&self, e: &Expr) -> ir::IrType {
+        self.expr_kind(e)
+    }
     fn runtime_func(&self, f: stdlib::StdFunc) -> FuncId {
         match f {
             stdlib::StdFunc::PrintStr => self.print_str,
             stdlib::StdFunc::PrintI64 => self.print_i64,
             stdlib::StdFunc::PrintBool => self.print_bool,
+            stdlib::StdFunc::PrintF64 => self.print_f64,
+            stdlib::StdFunc::PrintF32 => self.print_f32,
             stdlib::StdFunc::StdInLine => self.stdin_line,
             stdlib::StdFunc::ParseNumber => self.parse_number,
             stdlib::StdFunc::FromCString => self.from_cstring,

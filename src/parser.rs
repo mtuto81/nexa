@@ -4,7 +4,7 @@ use crate::ir;
 use crate::{Expr, Fun, Stmt, leak_str};
 
 #[derive(Clone, Debug)]
-pub enum Tok { Id(String), Num(i64), Str(Vec<u8>), True, False, Plus, Minus, Star, Slash, Percent, Eq, EqEq, NotEq, Lt, Le, Gt, Ge, Bang, And, Or, Colon, Dot, Arrow, LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Semi, Eof }
+pub enum Tok { Id(String), Num(i64), FNum(f64), Str(Vec<u8>), True, False, Plus, Minus, Star, Slash, Percent, Eq, EqEq, NotEq, Lt, Le, Gt, Ge, Bang, And, Or, Colon, Dot, Arrow, LParen, RParen, LBrace, RBrace, LBracket, RBracket, Comma, Semi, Eof }
 
 pub fn lex(s: &str) -> Result<Vec<Tok>, String> {
     let mut out = Vec::new(); let b = s.as_bytes(); let mut i = 0;
@@ -19,7 +19,31 @@ pub fn lex(s: &str) -> Result<Vec<Tok>, String> {
             if let Some(t) = t { out.push(t); i += 2; continue; }
         }
         match b[i] {
-            b'0'..=b'9' => { let j = i; while i < b.len() && b[i].is_ascii_digit() { i += 1; } out.push(Tok::Num(s[j..i].parse().unwrap())); }
+            b'0'..=b'9' => {
+                let j = i;
+                while i < b.len() && b[i].is_ascii_digit() { i += 1; }
+                let mut is_float = false;
+                if i < b.len() && b[i] == b'.' {
+                    is_float = true;
+                    i += 1;
+                    while i < b.len() && b[i].is_ascii_digit() { i += 1; }
+                }
+                if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+                    let k = i + 1;
+                    let mut digits_start = k;
+                    if k < b.len() && (b[k] == b'+' || b[k] == b'-') { digits_start = k + 1; }
+                    if digits_start < b.len() && b[digits_start].is_ascii_digit() {
+                        is_float = true;
+                        i = digits_start;
+                        while i < b.len() && b[i].is_ascii_digit() { i += 1; }
+                    }
+                }
+                if is_float {
+                    out.push(Tok::FNum(s[j..i].parse().map_err(|_| format!("invalid float literal `{}`", &s[j..i]))?));
+                } else {
+                    out.push(Tok::Num(s[j..i].parse().unwrap()));
+                }
+            }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => { let j = i; while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') { i += 1; } out.push(match &s[j..i] { "true" => Tok::True, "false" => Tok::False, x => Tok::Id(x.into()) }); }
             b'"' => { i += 1; let mut raw: Vec<u8> = Vec::new(); loop { if i >= b.len() { return Err("unterminated string".into()); } if b[i] == b'"' { i += 1; break; } if b[i] == b'\\' { i += 1; if i >= b.len() { return Err("unterminated escape sequence".into()); } match b[i] { b'n' => { raw.push(b'\n'); i += 1; } b'r' => { raw.push(b'\r'); i += 1; } b't' => { raw.push(b'\t'); i += 1; } b'\\' => { raw.push(b'\\'); i += 1; } b'"' => { raw.push(b'"'); i += 1; } b'x' => { i += 1; if i + 2 > b.len() { return Err("bad \\x escape".into()); } let hex = |c: u8| -> Option<u8> { match c { b'0'..=b'9' => Some(c - b'0'), b'a'..=b'f' => Some(c - b'a' + 10), b'A'..=b'F' => Some(c - b'A' + 10), _ => None } }; if let (Some(hi), Some(lo)) = (hex(b[i]), hex(b[i + 1])) { raw.push(hi * 16 + lo); i += 2; } else { return Err("bad hex digit in \\x escape".into()); } } other => return Err(format!("unsupported escape sequence \\{}", other as char)), } } else { raw.push(b[i]); i += 1; } } out.push(Tok::Str(raw)); }
             b'+' => { out.push(Tok::Plus); i += 1; } b'-' => { out.push(Tok::Minus); i += 1; } b'*' => { out.push(Tok::Star); i += 1; } b'/' => { out.push(Tok::Slash); i += 1; } b'%' => { out.push(Tok::Percent); i += 1; }
@@ -34,13 +58,13 @@ pub fn lex(s: &str) -> Result<Vec<Tok>, String> {
 
 pub fn resolve_ty_name(name: &str) -> Result<ir::IrType, String> { match name { "number" => Ok(ir::IrType::Number), "string" => Ok(ir::IrType::String), "boolean" => Ok(ir::IrType::Boolean), "Pointer" => Ok(ir::IrType::Pointer), other => Err(format!("unsupported generic type argument: {other}")) } }
 
-pub struct Parser { pub t: Vec<Tok>, pub p: usize, pub unsafe_depth: usize, pub extern_names: HashSet<String>, pub scope_type_param: Option<String> }
+pub struct Parser { pub t: Vec<Tok>, pub p: usize, pub unsafe_depth: usize, pub extern_names: HashSet<String>, pub scope_type_param: Option<String>, pub obj_lit_index: usize }
 impl Parser {
     pub fn peek(&self) -> &Tok { &self.t[self.p] }
     pub fn eat(&mut self) -> Tok { let x = self.t[self.p].clone(); self.p += 1; x }
     pub fn id(&mut self) -> Result<String, String> { match self.eat() { Tok::Id(x) => Ok(x), x => Err(format!("expected identifier, got {x:?}")) } }
     pub fn expect(&mut self, f: fn(&Tok) -> bool, msg: &str) -> Result<(), String> { if f(self.peek()) { self.eat(); Ok(()) } else { Err(msg.into()) } }
-    pub fn annotation(&mut self, type_param: Option<&str>) -> Result<Option<ir::IrType>, String> { if matches!(self.peek(), Tok::Colon) { self.eat(); if matches!(self.peek(), Tok::LParen) { self.eat(); if matches!(self.peek(), Tok::RParen) { self.eat(); self.expect(|x| matches!(x, Tok::Arrow), "expected => in closure type")?; let ret = self.id()?; if ret != "number" { return Err("Nexa v1 closures must return number".into()); } return Ok(Some(ir::IrType::ClosureNumber)); } else if matches!(self.peek(), Tok::LParen) { self.eat(); self.expect(|x| matches!(x, Tok::RParen), "Nexa v1 closure types take no arguments")?; self.expect(|x| matches!(x, Tok::Arrow), "expected => in closure type")?; let ret = self.id()?; if ret != "number" { return Err("Nexa v1 closures must return number".into()); } self.expect(|x| matches!(x, Tok::RParen), "expected ) in closure type")?; return Ok(Some(ir::IrType::ClosureNumber)); } else { return Err("Nexa v1 closure types take no arguments".into()); } } let ty = self.id()?; if Some(ty.as_str()) == type_param { return Ok(Some(ir::IrType::TParam)); } let array = if matches!(self.peek(), Tok::LBracket) { self.eat(); self.expect(|x| matches!(x, Tok::RBracket), "expected ] in type annotation")?; true } else { false }; return Ok(Some(if array { if ty != "number" { return Err("Nexa currently supports only number[] arrays".into()); } ir::IrType::NumberArray } else { match ty.as_str() { "number" => ir::IrType::Number, "string" => ir::IrType::String, "boolean" => ir::IrType::Boolean, "void" => ir::IrType::Void, "any" => ir::IrType::Any, "Pointer" => ir::IrType::Pointer, _ => ir::IrType::Class(leak_str(&ty)) } })); } Ok(None) }
+    pub fn annotation(&mut self, type_param: Option<&str>) -> Result<Option<ir::IrType>, String> { if matches!(self.peek(), Tok::Colon) { self.eat(); if matches!(self.peek(), Tok::LParen) { self.eat(); if matches!(self.peek(), Tok::RParen) { self.eat(); self.expect(|x| matches!(x, Tok::Arrow), "expected => in closure type")?; let ret = self.id()?; if ret != "number" { return Err("Nexa v1 closures must return number".into()); } return Ok(Some(ir::IrType::ClosureNumber)); } else if matches!(self.peek(), Tok::LParen) { self.eat(); self.expect(|x| matches!(x, Tok::RParen), "Nexa v1 closure types take no arguments")?; self.expect(|x| matches!(x, Tok::Arrow), "expected => in closure type")?; let ret = self.id()?; if ret != "number" { return Err("Nexa v1 closures must return number".into()); } self.expect(|x| matches!(x, Tok::RParen), "expected ) in closure type")?; return Ok(Some(ir::IrType::ClosureNumber)); } else { return Err("Nexa v1 closure types take no arguments".into()); } } let ty = self.id()?; if Some(ty.as_str()) == type_param { return Ok(Some(ir::IrType::TParam)); } let array = if matches!(self.peek(), Tok::LBracket) { self.eat(); self.expect(|x| matches!(x, Tok::RBracket), "expected ] in type annotation")?; true } else { false }; return Ok(Some(if array { match ty.as_str() { "number" => ir::IrType::NumberArray, "f32" => ir::IrType::Float32Array, "f64" => ir::IrType::Float64Array, _ => return Err(format!("invalid array element type `{ty}`; supported: number, f32, f64")) } } else { match ty.as_str() { "number" => ir::IrType::Number, "f32" => ir::IrType::F32, "f64" => ir::IrType::F64, "string" => ir::IrType::String, "boolean" => ir::IrType::Boolean, "void" => ir::IrType::Void, "any" => ir::IrType::Any, "Pointer" => ir::IrType::Pointer, _ => ir::IrType::Class(leak_str(&ty)) } })); } Ok(None) }
     pub fn expr(&mut self) -> Result<Expr, String> { self.or() }
     fn or(&mut self) -> Result<Expr, String> { self.bin(Self::and, &["||"]) }
     fn and(&mut self) -> Result<Expr, String> { self.bin(Self::compare, &["&&"]) }
@@ -65,6 +89,7 @@ impl Parser {
             }
             Tok::Id(name) => Expr::Var(name),
             Tok::Num(x) => Expr::Num(x),
+            Tok::FNum(x) => Expr::FNum(x),
             Tok::True => Expr::Bool(true),
             Tok::False => Expr::Bool(false),
             Tok::Str(x) => Expr::Str(x),
@@ -80,6 +105,24 @@ impl Parser {
                 }
                 self.expect(|x| matches!(x, Tok::RBracket), "expected ] to close array literal")?;
                 Expr::Array(elems)
+            }
+            Tok::LBrace => {
+                // Object literal `{ x: 1, y: 2 }`. Only legal where a named
+                // interface type is expected (verified by the checker); each
+                // literal site receives its own automatically-synthesized
+                // struct layout (`__objlit_n`).
+                let mut fields = Vec::new();
+                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                    let field_name = self.id()?;
+                    self.expect(|x| matches!(x, Tok::Colon), "expected : after object literal field name")?;
+                    let value = self.expr()?;
+                    fields.push((field_name, value));
+                    if matches!(self.peek(), Tok::Comma) { self.eat(); } else { break; }
+                }
+                self.expect(|x| matches!(x, Tok::RBrace), "expected } to close object literal")?;
+                let synth = format!("__objlit_{}", self.obj_lit_index);
+                self.obj_lit_index += 1;
+                Expr::ObjectLiteral(synth, fields)
             }
             Tok::LParen => {
                 if matches!(self.peek(), Tok::RParen) && (matches!(self.t.get(self.p + 1), Some(Tok::Arrow)) || matches!(self.t.get(self.p + 1), Some(Tok::Colon))) {
@@ -111,7 +154,7 @@ impl Parser {
                 if let Expr::Var(ref obj_name) = x {
                     if obj_name == "console" && field == "log" {
                         x = Expr::Call("std.log".into(), args);
-                    } else if obj_name == "std" && (field == "log" || field == "in" || field == "parseNumber" || field == "toCString" || field == "fromCString" || field == "funcPtr" || field == "strlen" || field == "charAt") {
+                    } else if obj_name == "std" && (field == "log" || field == "in" || field == "parseNumber" || field == "toCString" || field == "fromCString" || field == "funcPtr" || field == "strlen" || field == "charAt" || field == "toF64" || field == "toF32" || field == "toInt") {
                         x = Expr::Call(format!("std.{field}"), args);
                     } else {
                         x = Expr::MethodCall(Box::new(x), field, args);

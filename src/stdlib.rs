@@ -27,6 +27,9 @@ pub enum StdOp {
     FuncPtr,
     StrLen,
     CharAt,
+    ToF32,
+    ToF64,
+    ToInt,
     NetSockaddrIn,
     NetSocket,
     NetBind,
@@ -56,6 +59,9 @@ impl StdOp {
             "std.funcPtr" => Some(StdOp::FuncPtr),
             "std.strlen" => Some(StdOp::StrLen),
             "std.charAt" => Some(StdOp::CharAt),
+            "std.toF32" => Some(StdOp::ToF32),
+            "std.toF64" => Some(StdOp::ToF64),
+            "std.toInt" => Some(StdOp::ToInt),
             "std.net.sockaddrIn" => Some(StdOp::NetSockaddrIn),
             "std.net.socket" => Some(StdOp::NetSocket),
             "std.net.bind" => Some(StdOp::NetBind),
@@ -86,6 +92,9 @@ impl StdOp {
             StdOp::FuncPtr => IrType::Pointer,
             StdOp::StrLen => IrType::Number,
             StdOp::CharAt => IrType::String,
+            StdOp::ToF32 => IrType::F32,
+            StdOp::ToF64 => IrType::F64,
+            StdOp::ToInt => IrType::Number,
             StdOp::NetSockaddrIn => IrType::Pointer,
             StdOp::NetSocket
             | StdOp::NetBind
@@ -135,7 +144,7 @@ pub fn check_call(
                 return Err("std.log accepts one argument".into());
             }
             let t = arg_types[0];
-            if !matches!(t, Ty::Number | Ty::Boolean | Ty::String) {
+            if !matches!(t, Ty::Number | Ty::Boolean | Ty::String | Ty::F32 | Ty::F64 | Ty::Any) {
                 return Err(format!("std.log does not accept {t:?} values in the raw ABI"));
             }
             Ok(Ty::Void)
@@ -220,6 +229,26 @@ pub fn check_call(
                 return Err(format!("std.charAt expects a number index, got {i:?}"));
             }
             Ok(Ty::String)
+        }
+        StdOp::ToF32 | StdOp::ToF64 => {
+            if n_args != 1 {
+                return Err(format!("{} accepts one argument", if matches!(op, StdOp::ToF32) { "std.toF32" } else { "std.toF64" }));
+            }
+            let t = arg_types[0];
+            if !matches!(t, Ty::Number | Ty::F32 | Ty::F64 | Ty::Any) {
+                return Err(format!("{} expects a number, f32, or f64 argument, got {t:?}", if matches!(op, StdOp::ToF32) { "std.toF32" } else { "std.toF64" }));
+            }
+            Ok(if matches!(op, StdOp::ToF32) { Ty::F32 } else { Ty::F64 })
+        }
+        StdOp::ToInt => {
+            if n_args != 1 {
+                return Err("std.toInt accepts one argument".into());
+            }
+            let t = arg_types[0];
+            if !matches!(t, Ty::Number | Ty::F32 | Ty::F64 | Ty::Any) {
+                return Err(format!("std.toInt expects a number, f32, or f64 argument, got {t:?}"));
+            }
+            Ok(Ty::Number)
         }
         StdOp::NetSockaddrIn => {
             if n_args != 2 {
@@ -385,6 +414,8 @@ pub enum StdFunc {
     PrintStr,
     PrintI64,
     PrintBool,
+    PrintF64,
+    PrintF32,
     StdInLine,
     ParseNumber,
     FromCString,
@@ -412,6 +443,10 @@ pub enum StdFunc {
 pub trait StdEmitter {
     fn emit_expr(&mut self, b: &mut FunctionBuilder, e: &Expr, vars: &HashMap<String, Variable>) -> Result<Value, String>;
     fn expr_is_boolean(&self, e: &Expr) -> bool;
+    // The statically-known type of an expression (codegen's expr_kind).
+    fn expr_ir_kind(&self, _e: &Expr) -> IrType {
+        IrType::Any
+    }
     fn runtime_func(&self, f: StdFunc) -> FuncId;
     fn func_id(&self, name: &str) -> Option<FuncId>;
     fn intern_string(&mut self, s: &[u8], null_terminated: bool) -> Result<DataId, String>;
@@ -446,7 +481,11 @@ pub fn emit_std_call(
             let fid = if ctx.expr_is_boolean(&args[0]) {
                 ctx.runtime_func(StdFunc::PrintBool)
             } else {
-                ctx.runtime_func(StdFunc::PrintI64)
+                match ctx.expr_ir_kind(&args[0]) {
+                    IrType::F64 => ctx.runtime_func(StdFunc::PrintF64),
+                    IrType::F32 => ctx.runtime_func(StdFunc::PrintF32),
+                    _ => ctx.runtime_func(StdFunc::PrintI64),
+                }
             };
             let callee = ctx.declare_func_in_func(fid, b.func);
             let call = b.ins().call(callee, &[x]);
@@ -465,6 +504,38 @@ pub fn emit_std_call(
             let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::ParseNumber), b.func);
             let call = b.ins().call(callee, &[x]);
             Ok(b.func.dfg.inst_results(call)[0])
+        }
+        StdOp::ToInt => {
+            if args.len() != 1 {
+                return Err("std.toInt accepts one expression".into());
+            }
+            let x = ctx.emit_expr(b, &args[0], vars)?;
+            Ok(match ctx.expr_ir_kind(&args[0]) {
+                IrType::F32 | IrType::F64 => b.ins().fcvt_to_sint(types::I64, x),
+                _ => x,
+            })
+        }
+        StdOp::ToF32 => {
+            if args.len() != 1 {
+                return Err("std.toF32 accepts one expression".into());
+            }
+            let x = ctx.emit_expr(b, &args[0], vars)?;
+            Ok(match ctx.expr_ir_kind(&args[0]) {
+                IrType::F64 => b.ins().fdemote(types::F32, x),
+                IrType::F32 => x,
+                _ => b.ins().fcvt_from_sint(types::F32, x),
+            })
+        }
+        StdOp::ToF64 => {
+            if args.len() != 1 {
+                return Err("std.toF64 accepts one expression".into());
+            }
+            let x = ctx.emit_expr(b, &args[0], vars)?;
+            Ok(match ctx.expr_ir_kind(&args[0]) {
+                IrType::F32 => b.ins().fpromote(types::F64, x),
+                IrType::F64 => x,
+                _ => b.ins().fcvt_from_sint(types::F64, x),
+            })
         }
         StdOp::ToCString => {
             if args.len() != 1 {
