@@ -7,21 +7,86 @@ use swc_ecma_parser::{lexer::Lexer, Parser as SwcParser, StringInput, Syntax, Ts
 
 use crate::{blank_unsafe_markers, extract_extern_blocks};
 
+// Result of module resolution: the flattened single-file program plus the
+// static namespace-import bindings it needs at parse/check time.
+//
+// `namespaces` maps each `import * as ns` alias to the exported member names
+// of the module it points at. Both the swc checker and the Nexa parser consult
+// it so `ns.member(...)` can be resolved to the flat top-level name `member`.
+pub(crate) struct FlattenResult {
+    pub(crate) code: String,
+    pub(crate) namespaces: HashMap<String, HashSet<String>>,
+}
+
 struct LoadedModule {
     display: String,
     canon: PathBuf,
     stripped: String,
     exports: HashSet<String>,
     imports: Vec<(String, PathBuf)>,
+    // `import * as ns` bindings: (alias, resolved target path). The target may
+    // be a real file or a bundled std/<name> module.
+    namespace_imports: Vec<(String, PathBuf)>,
 }
 
-pub(crate) fn resolve_and_flatten(entry: &Path) -> Result<String, String> {
+// Bundled stdlib modules, embedded into the compiler binary. The `std/` import
+// prefix is reserved for these; they are not searched as files on disk. Each
+// one is a normal Nexa module that happens to be compiled into the binary.
+const BUNDLED_STD: &[(&str, &str)] = &[
+    ("net", include_str!("../std/net.ts")),
+    ("process", include_str!("../std/process.ts")),
+];
+const BUNDLED_STD_PREFIX: &str = "/nexa_std/";
+
+fn bundled_keys() -> Vec<&'static str> {
+    BUNDLED_STD.iter().map(|(name, _)| *name).collect()
+}
+
+fn bundled_source(name: &str) -> Result<&'static str, String> {
+    BUNDLED_STD
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, src)| *src)
+        .ok_or_else(|| format!("unknown bundled std module `std/{name}`; available: {}", bundled_keys().join(", ")))
+}
+
+fn bundled_path(name: &str) -> PathBuf {
+    PathBuf::from(format!("{BUNDLED_STD_PREFIX}{name}.ts"))
+}
+
+fn is_bundled_path(p: &Path) -> bool {
+    p.starts_with(BUNDLED_STD_PREFIX)
+}
+
+pub(crate) fn resolve_and_flatten(entry: &Path) -> Result<FlattenResult, String> {
     let mut done: HashMap<PathBuf, usize> = HashMap::new();
     let mut order: Vec<LoadedModule> = Vec::new();
     let mut stack: Vec<(PathBuf, String)> = Vec::new();
     let mut owners: HashMap<String, String> = HashMap::new();
     visit(entry, &mut stack, &mut done, &mut order, &mut owners)?;
-    Ok(order.iter().map(|m| m.stripped.as_str()).collect::<Vec<_>>().join("\n"))
+    let mut namespaces: HashMap<String, HashSet<String>> = HashMap::new();
+    for m in &order {
+        for (ns, target) in &m.namespace_imports {
+            if ns == "std" || ns == "console" {
+                return Err(format!("`{}`: the namespace alias `{ns}` is reserved for built-in std/console intrinsics", m.display));
+            }
+            if owners.contains_key(ns) {
+                return Err(format!("`{}`: namespace alias `{ns}` conflicts with a top-level declaration (in `{}`)", m.display, owners[ns]));
+            }
+            let tcanon = fs_canonicalize(target)?;
+            let idx = *done.get(&tcanon).ok_or_else(|| format!("internal error: namespace import `{ns}` target `{}` was not resolved", target.display()))?;
+            let members: HashSet<String> = order[idx].exports.iter().cloned().collect();
+            if let Some(prev) = namespaces.get(ns) {
+                if *prev != members {
+                    return Err(format!("`{}`: namespace alias `{ns}` is bound to more than one different module", m.display));
+                }
+            } else {
+                namespaces.insert(ns.clone(), members);
+            }
+        }
+    }
+    let code = order.iter().map(|m| m.stripped.as_str()).collect::<Vec<_>>().join("\n");
+    Ok(FlattenResult { code, namespaces })
 }
 
 fn visit(path: &Path, stack: &mut Vec<(PathBuf, String)>, done: &mut HashMap<PathBuf, usize>, order: &mut Vec<LoadedModule>, owners: &mut HashMap<String, String>) -> Result<(), String> {
@@ -38,6 +103,9 @@ fn visit(path: &Path, stack: &mut Vec<(PathBuf, String)>, done: &mut HashMap<Pat
     for (_, target) in loaded.imports.clone() {
         visit(&target, stack, done, order, owners)?;
     }
+    for (_, target) in loaded.namespace_imports.clone() {
+        visit(&target, stack, done, order, owners)?;
+    }
     stack.pop();
     for (name, target) in &loaded.imports {
         let tcanon = fs_canonicalize(target)?;
@@ -51,10 +119,22 @@ fn visit(path: &Path, stack: &mut Vec<(PathBuf, String)>, done: &mut HashMap<Pat
     Ok(())
 }
 
-fn fs_canonicalize(path: &Path) -> Result<PathBuf, String> { std::fs::canonicalize(path).map_err(|_| format!("cannot read module `{}`: no such file", path.display())) }
+fn fs_canonicalize(path: &Path) -> Result<PathBuf, String> {
+    if is_bundled_path(path) {
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        bundled_source(&name)?; // validate that the bundled module actually exists
+        return Ok(path.to_path_buf());
+    }
+    std::fs::canonicalize(path).map_err(|_| format!("cannot read module `{}`: no such file", path.display()))
+}
 
 fn load_module(path: &Path, display: &str, canon: &Path, owners: &mut HashMap<String, String>) -> Result<LoadedModule, String> {
-    let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read module `{display}`: {e}"))?;
+    let src = if is_bundled_path(path) {
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        bundled_source(&name)?.to_string()
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read module `{display}`: {e}"))?
+    };
     let (_externs, clean) = extract_extern_blocks(&src)?;
     let blanked = blank_unsafe_markers(&clean)?;
     let (module, base) = parse_swc_with_base(&blanked, display)?;
@@ -63,8 +143,10 @@ fn load_module(path: &Path, display: &str, canon: &Path, owners: &mut HashMap<St
     let mut clause_exports: Vec<String> = Vec::new();
     let mut locals: HashSet<String> = HashSet::new();
     let mut imports: Vec<(String, PathBuf)> = Vec::new();
+    let mut namespace_imports: Vec<(String, PathBuf)> = Vec::new();
     let mut raw_imports: Vec<(String, String)> = Vec::new();
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut raw_namespace_imports: Vec<(String, String)> = Vec::new();
+    let parent = if is_bundled_path(path) { Path::new(BUNDLED_STD_PREFIX) } else { path.parent().unwrap_or_else(|| Path::new(".")) };
     for item in &module.body {
         match item {
             ModuleItem::ModuleDecl(d) => match d {
@@ -77,8 +159,16 @@ fn load_module(path: &Path, display: &str, canon: &Path, owners: &mut HashMap<St
                                 if n.imported.is_some() { return Err(format!("`{display}`: import renaming (`{{ x as y }}`) is not supported; import `{}` under its own name", n.local.sym)); }
                                 raw_imports.push((n.local.sym.to_string(), i.src.value.as_str().unwrap_or_default().to_string()));
                             }
-                            ImportSpecifier::Default(_) => return Err(format!("`{display}`: default imports are not supported in this version; use named imports `{{ X }} from \"./file.ts\"`")),
-                            ImportSpecifier::Namespace(_) => return Err(format!("`{display}`: `import * as ns` is not supported in this version; use named imports")),
+                            ImportSpecifier::Default(_) => return Err(format!("`{display}`: default imports are not supported in this version; use named imports `{{ X }} from \"./file.ts\"` or `import * as ns from \"./file.ts\"`")),
+                            ImportSpecifier::Namespace(n) => {
+                                // `import * as ns from "..."`: a static
+                                // namespace alias over the target module's
+                                // exports. Every target (including std/<name>
+                                // bundles) is pulled into the flat program as a
+                                // dependency and the alias is recorded for the
+                                // parser/checker.
+                                raw_namespace_imports.push((n.local.sym.to_string(), i.src.value.as_str().unwrap_or_default().to_string()));
+                            }
                         }
                     }
                     cuts.push(stmt_cut(&src, off(base, i.span.lo), off(base, i.span.hi), "import", display)?);
@@ -150,18 +240,36 @@ fn load_module(path: &Path, display: &str, canon: &Path, owners: &mut HashMap<St
         }
     }
     for (name, spec) in raw_imports {
-        validate_specifier(display, &spec)?;
-        imports.push((name, parent.join(spec.strip_prefix("./").unwrap_or(&spec))));
+        imports.push((name, resolve_target(display, &spec, parent)?));
+    }
+    for (name, spec) in raw_namespace_imports {
+        namespace_imports.push((name, resolve_target(display, &spec, parent)?));
     }
     cuts.sort_by(|a, b| b.0.cmp(&a.0));
     let mut out = src;
     for (start, end) in cuts { out.replace_range(start..end, ""); }
-    Ok(LoadedModule { display: display.to_string(), canon: canon.to_path_buf(), stripped: out, exports, imports })
+    Ok(LoadedModule { display: display.to_string(), canon: canon.to_path_buf(), stripped: out, exports, imports, namespace_imports })
+}
+
+fn resolve_target(display: &str, spec: &str, parent: &Path) -> Result<PathBuf, String> {
+    if let Some(rest) = spec.strip_prefix("std/") {
+        validate_specifier(display, spec)?;
+        return Ok(bundled_path(rest));
+    }
+    validate_specifier(display, spec)?;
+    Ok(parent.join(spec.strip_prefix("./").unwrap_or(spec)))
 }
 
 fn validate_specifier(display: &str, spec: &str) -> Result<(), String> {
+    if let Some(rest) = spec.strip_prefix("std/") {
+        if rest.is_empty() || rest.contains('/') || rest.starts_with('.') {
+            return Err(format!("`{display}`: invalid std path \"{spec}\"; expected `std/<name>` with no slashes or dots"));
+        }
+        bundled_source(rest)?;
+        return Ok(());
+    }
     if !(spec.starts_with("./") || spec.starts_with("../")) {
-        return Err(format!("`{display}`: import \"{spec}\" is not a relative path; only `./` and `../` imports are supported (package/bare-specifier resolution is out of scope for this version)"));
+        return Err(format!("`{display}`: import \"{spec}\" is not a relative path or a bundled std module; only `./`, `../`, and `std/` imports are supported (package/bare-specifier resolution is out of scope for this version)"));
     }
     if !spec.ends_with(".ts") {
         return Err(format!("`{display}`: import \"{spec}\" must end with an explicit `.ts` extension"));

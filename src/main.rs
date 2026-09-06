@@ -1,7 +1,7 @@
 use swc_common::{sync::Lrc, FileName, SourceMap};
 use swc_ecma_ast::{EsVersion, Module as SwcModule};
 use swc_ecma_parser::{lexer::Lexer, Parser as SwcParser, StringInput, Syntax, TsSyntax};
-use std::{collections::HashMap, env, fs, path::Path, process::Command};
+use std::{collections::{HashMap, HashSet}, env, fs, path::Path, process::Command};
 mod ir;
 mod modules;
 mod parser;
@@ -36,7 +36,7 @@ fn parse_typescript(source: &str, filename: &str) -> Result<(), String> {
     let (externs, clean) = extract_extern_blocks(source)?;
     let swc_src = blank_unsafe_markers(&clean)?;
     let module = parse_swc_module(&swc_src, filename)?;
-    check_module_with_externs(&module, &externs)
+    check_module_with_externs(&module, &externs, &HashMap::new())
 }
 
 #[derive(Clone, Debug)]
@@ -268,8 +268,12 @@ fn parse_nexa(source: &str) -> Result<(Vec<ClassDecl>, Vec<InterfaceDecl>, Vec<F
 }
 
 fn parse_nexa_with_externs(source: &str, externs: &HashMap<String, ExternSig>) -> Result<(Vec<ClassDecl>, Vec<InterfaceDecl>, Vec<Fun>, Vec<GlobalDecl>), String> {
+    parse_nexa_with_externs_and_ns(source, externs, &HashMap::new())
+}
+
+fn parse_nexa_with_externs_and_ns(source: &str, externs: &HashMap<String, ExternSig>, namespaces: &HashMap<String, HashSet<String>>) -> Result<(Vec<ClassDecl>, Vec<InterfaceDecl>, Vec<Fun>, Vec<GlobalDecl>), String> {
     let lowered_src = strip_top_level_entry_call(source);
-    let mut p = Parser { t: lex(&lowered_src)?, p: 0, unsafe_depth: 0, extern_names: externs.keys().cloned().collect(), scope_type_param: None, obj_lit_index: 0 };
+    let mut p = Parser { t: lex(&lowered_src)?, p: 0, unsafe_depth: 0, extern_names: externs.keys().cloned().collect(), scope_type_param: None, obj_lit_index: 0, namespaces: namespaces.clone() };
     let mut classes = Vec::new();
     let mut interfaces = Vec::new();
     let mut functions = Vec::new();
@@ -515,7 +519,7 @@ fn subst_expr(e: &mut Expr, ty: ir::IrType) {
     }
 }
 
-fn run() -> Result<(), String> { let a: Vec<String> = env::args().collect(); if a.len() < 2 { return Err("usage: nexa <source.ts> [-o executable]".into()); } let flat = modules::resolve_and_flatten(Path::new(&a[1]))?; let (externs, clean) = extract_extern_blocks(&flat)?; let swc_src = blank_unsafe_markers(&clean)?; let module = parse_swc_module(&swc_src, &a[1])?; check_module_with_externs(&module, &externs)?; let (classes, interfaces, functions, globals) = parse_nexa_with_externs(&clean, &externs)?; let mut functions = monomorphize(functions)?; inject_global_init(&mut functions, &globals); let ir = ir::lower_program(&functions); if env::var_os("NEXA_DUMP_IR").is_some() { eprintln!("{ir}"); } let mut c = Compiler::new()?; c.register_class_layouts(&classes)?; c.register_interface_layouts(&interfaces)?; c.declare_externs(&externs)?; c.compile(&classes, &functions, &globals)?; let obj = c.m.finish(); let objpath = "/tmp/nexa.o"; fs::write(objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; let out = a.iter().position(|x| x == "-o").and_then(|i| a.get(i + 1)).cloned().unwrap_or_else(|| "a.out".into()); if !Path::new("runtime.c").exists() { return Err("runtime.c is missing".into()); } let status = Command::new("gcc").args([objpath, "runtime.c", "-o", &out]).status().map_err(|e| e.to_string())?; if !status.success() { return Err("link failed".into()); } println!("built {out}"); Ok(()) }
+fn run() -> Result<(), String> { let a: Vec<String> = env::args().collect(); if a.len() < 2 { return Err("usage: nexa <source.ts> [-o executable]".into()); } let flat = modules::resolve_and_flatten(Path::new(&a[1]))?; let (externs, clean) = extract_extern_blocks(&flat.code)?; let swc_src = blank_unsafe_markers(&clean)?; let module = parse_swc_module(&swc_src, &a[1])?; check_module_with_externs(&module, &externs, &flat.namespaces)?; let (classes, interfaces, functions, globals) = parse_nexa_with_externs_and_ns(&clean, &externs, &flat.namespaces)?; let mut functions = monomorphize(functions)?; inject_global_init(&mut functions, &globals); let ir = ir::lower_program(&functions); if env::var_os("NEXA_DUMP_IR").is_some() { eprintln!("{ir}"); } let mut c = Compiler::new()?; c.register_class_layouts(&classes)?; c.register_interface_layouts(&interfaces)?; c.declare_externs(&externs)?; c.compile(&classes, &functions, &globals)?; let obj = c.m.finish(); let objpath = "/tmp/nexa.o"; fs::write(objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; let out = a.iter().position(|x| x == "-o").and_then(|i| a.get(i + 1)).cloned().unwrap_or_else(|| "a.out".into()); if !Path::new("runtime.c").exists() { return Err("runtime.c is missing".into()); } let status = Command::new("gcc").args([objpath, "runtime.c", "-o", &out]).status().map_err(|e| e.to_string())?; if !status.success() { return Err("link failed".into()); } println!("built {out}"); Ok(()) }
 
 #[cfg(test)]
 mod safety_tests {
@@ -649,7 +653,7 @@ mod safety_tests {
         let (externs, clean) = extract_extern_blocks(source).expect("extract extern");
         let swc_src = blank_unsafe_markers(&clean).expect("blank unsafe markers");
         let module = parse_swc_module(&swc_src, &format!("{tag}.ts")).expect("swc parse");
-        check_module_with_externs(&module, &externs).expect("type check");
+        check_module_with_externs(&module, &externs, &HashMap::new()).expect("type check");
         let (classes, _interfaces, functions, _globals) = parse_nexa_with_externs(&clean, &externs).expect("parse nexa program with externs");
         let mut c = Compiler::new().expect("compiler init");
         c.register_class_layouts(&classes).expect("register class layouts");
@@ -1174,61 +1178,192 @@ mod safety_tests {
 
     #[test]
     fn std_net_sockaddr_in_binds_socket() {
-        // std.net.sockaddrIn must build a real struct sockaddr_in (proper
-        // htons/htonl network byte order) that is valid enough to bind a real
-        // IPv4 socket to. bind returns 0 on success.
+        // The bundled std/net module's sockaddrIn must build a real struct
+        // sockaddr_in (proper htons/htonl network byte order) that is valid
+        // enough to bind a real IPv4 socket to. bind returns 0 on success.
         //
         // Port 0 asks the kernel to assign an ephemeral port. This is deliberate:
         // binding a fixed port (as the HTTP server does with 5000) would make the
         // test collide with leftover TIME_WAIT sockets on that port (the regression
         // test does not set SO_REUSEADDR), causing EADDRINUSE and flaky failures.
         // The socket is closed immediately, so no resource lingers.
-        let source = r#"
+        let dir = scratch_dir("stdnet");
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as net from "std/net";
+
             function main(): number {
-              let addr: Pointer = std.net.sockaddrIn(0, 0);
-              let fd: number = unsafe { std.net.socket(2, 1, 0) };
-              let bound: number = unsafe { std.net.bind(fd, addr, 16) };
+              let addr: Pointer = net.sockaddrIn(0, 0);
+              let fd: number = unsafe { net.socket(2, 1, 0) };
+              let bound: number = unsafe { net.bind(fd, addr, 16) };
               std.log(bound);
-              unsafe { std.net.close(fd); }
+              unsafe { net.close(fd); }
               return 0;
             }
-            main();
-        "#;
-        let out = build_and_run_prog(source, "std_net_bind");
+        "#);
+        let out = build_and_run(&entry).expect("std/net program must compile and run");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines, vec!["0"],
-            "std.net.sockaddrIn+socket+bind must bind successfully (return 0)");
+            "std/net sockaddrIn+socket+bind must bind successfully (return 0)");
     }
 
     #[test]
     fn std_process_fork_child_and_parent_both_log_then_wait() {
-        // fork hands back 0 to the child and the child's PID to the parent.
-        // Both must log their line; "child exited" (after waitpid) must come
-        // last. The first two lines may appear in either order due to real
-        // process scheduling. nexa_process_exit flushes so the child's own
-        // buffered output survives the (fully-buffered, piped) capture.
-        let source = r#"
+        // The bundled std/process module's fork hands back 0 to the child and
+        // the child's PID to the parent. Both must log their line; "child
+        // exited" (after wait) must come last. The first two lines may appear
+        // in either order due to real process scheduling. nexa_process_exit
+        // flushes so the child's own buffered output survives the
+        // (fully-buffered, piped) capture.
+        let dir = scratch_dir("procfork");
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as proc from "std/process";
+
             function main(): number {
-              let pid: number = unsafe { std.process.fork() };
+              let pid: number = unsafe { proc.fork() };
               if (pid == 0) {
                 std.log("child running");
-                unsafe { std.process.exit(0); }
+                unsafe { proc.exit(0); }
                 return 0;
               } else {
                 std.log("parent waiting");
-                let status: number = unsafe { std.process.wait(pid) };
+                let status: number = unsafe { proc.wait(pid) };
                 std.log("child exited");
                 return 0;
               }
             }
-            main();
-        "#;
-        let out = build_and_run_prog(source, "std_process_fork");
+        "#);
+        let out = build_and_run(&entry).expect("std/process program must compile and run");
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines.contains(&"child running"), "child must log 'child running', got {lines:?}");
         assert!(lines.contains(&"parent waiting"), "parent must log 'parent waiting', got {lines:?}");
         assert_eq!(lines.last().copied(), Some("child exited"),
             "'child exited' must be the last line (after wait), got {lines:?}");
+    }
+
+    #[test]
+    fn namespace_import_calls_flat_functions() {
+        // `import * as ns from "./file.ts"` must resolve `ns.double(x)` against
+        // the flat top-level function name, so calls compile and run normally.
+        let dir = scratch_dir("nsmath");
+        write_module(&dir, "math.ts", r#"
+            export function double(x: number): number {
+              return x * 2;
+            }
+        "#);
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as math from "./math.ts";
+
+            function main(): number {
+              std.log(math.double(21));
+              std.log(math.double(math.double(5)));
+              return 0;
+            }
+        "#);
+        let out = build_and_run(&entry).expect("namespace import program must compile and run");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines, vec!["42", "20"], "namespace calls must resolve to flat functions, got {lines:?}");
+    }
+
+    #[test]
+    fn namespace_import_class_instantiation() {
+        // `new ns.Class(...)` must map to the flat top-level class name.
+        let dir = scratch_dir("nsclass");
+        write_module(&dir, "widget.ts", r#"
+            export class Widget {
+              value: number;
+              constructor(value: number) {
+                this.value = value;
+              }
+              get(): number {
+                return this.value;
+              }
+            }
+        "#);
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as widgets from "./widget.ts";
+
+            function main(): number {
+              let w = new widgets.Widget(7);
+              std.log(w.get());
+              return 0;
+            }
+        "#);
+        let out = build_and_run(&entry).expect("namespace class program must compile and run");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines, vec!["7"], "namespace class must instantiate and run, got {lines:?}");
+    }
+
+    #[test]
+    fn namespace_import_rejects_missing_member() {
+        let dir = scratch_dir("nsmiss");
+        write_module(&dir, "math.ts", r#"
+            export function double(x: number): number { return x * 2; }
+        "#);
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as math from "./math.ts";
+            function main(): number { return math.triple(2); }
+        "#);
+        build_error(&entry).expect_err("calling a non-exported namespace member must be rejected");
+    }
+
+    #[test]
+    fn namespace_import_rejects_bare_specifier() {
+        let dir = scratch_dir("nsbare");
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as math from "math";
+            function main(): number { return 0; }
+        "#);
+        build_error(&entry).expect_err("bare (non-relative, non-`std/`) import specifiers must be rejected");
+    }
+
+    #[test]
+    fn namespace_import_rejects_missing_extension() {
+        let dir = scratch_dir("nsext");
+        write_module(&dir, "math.ts", r#"
+            export function double(x: number): number { return x * 2; }
+        "#);
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as math from "./math";
+            function main(): number { return 0; }
+        "#);
+        build_error(&entry).expect_err("imports lacking an explicit `.ts` extension must be rejected");
+    }
+
+    #[test]
+    fn namespace_import_reserved_alias_std() {
+        let dir = scratch_dir("nsstd");
+        write_module(&dir, "math.ts", r#"
+            export function double(x: number): number { return x * 2; }
+        "#);
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as std from "./math.ts";
+            function main(): number { return 0; }
+        "#);
+        build_error(&entry).expect_err("the `std` alias is reserved for built-in intrinsics");
+    }
+
+    #[test]
+    fn namespace_import_alias_conflicts_with_top_level() {
+        let dir = scratch_dir("nscwash");
+        write_module(&dir, "math.ts", r#"
+            export function double(x: number): number { return x * 2; }
+        "#);
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as math from "./math.ts";
+            function math(): number { return 0; }
+            function main(): number { return 0; }
+        "#);
+        build_error(&entry).expect_err("a namespace alias that clashes with a top-level declaration must be rejected");
+    }
+
+    #[test]
+    fn namespace_import_unknown_std_module() {
+        let dir = scratch_dir("nsunknown");
+        let entry = write_module(&dir, "main.ts", r#"
+            import * as zed from "std/nonexistent";
+            function main(): number { return 0; }
+        "#);
+        build_error(&entry).expect_err("an unknown `std/<name>` module must be rejected with available modules listed");
     }
 
     #[test]
@@ -1956,12 +2091,12 @@ mod safety_tests {
     }
     fn build_and_run(entry: &std::path::Path) -> Result<String, String> {
         let flat = crate::modules::resolve_and_flatten(entry)?;
-        let (externs, clean) = extract_extern_blocks(&flat)?;
+        let (externs, clean) = extract_extern_blocks(&flat.code)?;
         let swc_src = blank_unsafe_markers(&clean)?;
         let filename = entry.file_name().unwrap_or_default().to_string_lossy().to_string();
         let module = parse_swc_module(&swc_src, &filename)?;
-        check_module_with_externs(&module, &externs)?;
-        let (classes, interfaces, functions, globals) = parse_nexa_with_externs(&clean, &externs)?;
+        check_module_with_externs(&module, &externs, &flat.namespaces)?;
+        let (classes, interfaces, functions, globals) = parse_nexa_with_externs_and_ns(&clean, &externs, &flat.namespaces)?;
         let mut functions = monomorphize(functions)?;
         inject_global_init(&mut functions, &globals);
         let mut c = Compiler::new().map_err(|e| e.to_string())?;
@@ -1981,12 +2116,12 @@ mod safety_tests {
     }
     fn build_error(entry: &std::path::Path) -> Result<(), String> {
         let flat = crate::modules::resolve_and_flatten(entry)?;
-        let (externs, clean) = extract_extern_blocks(&flat)?;
+        let (externs, clean) = extract_extern_blocks(&flat.code)?;
         let swc_src = blank_unsafe_markers(&clean)?;
         let filename = entry.file_name().unwrap_or_default().to_string_lossy().to_string();
         let module = parse_swc_module(&swc_src, &filename)?;
-        check_module_with_externs(&module, &externs)?;
-        let (classes, interfaces, functions, globals) = parse_nexa_with_externs(&clean, &externs)?;
+        check_module_with_externs(&module, &externs, &flat.namespaces)?;
+        let (classes, interfaces, functions, globals) = parse_nexa_with_externs_and_ns(&clean, &externs, &flat.namespaces)?;
         let mut functions = monomorphize(functions)?;
         inject_global_init(&mut functions, &globals);
         let mut c = Compiler::new().map_err(|e| e.to_string())?;

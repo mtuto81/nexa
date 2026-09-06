@@ -30,22 +30,11 @@ pub enum StdOp {
     ToF32,
     ToF64,
     ToInt,
-    NetSockaddrIn,
-    NetSocket,
-    NetBind,
-    NetListen,
-    NetAccept,
-    NetRecv,
-    NetSend,
-    NetClose,
-    ProcFork,
     ProcExec1,
     ProcExec2,
     ProcPipe,
     ProcPipeRead,
     ProcPipeWrite,
-    ProcWait,
-    ProcExit,
 }
 
 impl StdOp {
@@ -62,22 +51,11 @@ impl StdOp {
             "std.toF32" => Some(StdOp::ToF32),
             "std.toF64" => Some(StdOp::ToF64),
             "std.toInt" => Some(StdOp::ToInt),
-            "std.net.sockaddrIn" => Some(StdOp::NetSockaddrIn),
-            "std.net.socket" => Some(StdOp::NetSocket),
-            "std.net.bind" => Some(StdOp::NetBind),
-            "std.net.listen" => Some(StdOp::NetListen),
-            "std.net.accept" => Some(StdOp::NetAccept),
-            "std.net.recv" => Some(StdOp::NetRecv),
-            "std.net.send" => Some(StdOp::NetSend),
-            "std.net.close" => Some(StdOp::NetClose),
-            "std.process.fork" => Some(StdOp::ProcFork),
             "std.process.exec1" => Some(StdOp::ProcExec1),
             "std.process.exec2" => Some(StdOp::ProcExec2),
             "std.process.pipe" => Some(StdOp::ProcPipe),
             "std.process.pipeReadFd" => Some(StdOp::ProcPipeRead),
             "std.process.pipeWriteFd" => Some(StdOp::ProcPipeWrite),
-            "std.process.wait" => Some(StdOp::ProcWait),
-            "std.process.exit" => Some(StdOp::ProcExit),
             _ => None,
         }
     }
@@ -95,22 +73,11 @@ impl StdOp {
             StdOp::ToF32 => IrType::F32,
             StdOp::ToF64 => IrType::F64,
             StdOp::ToInt => IrType::Number,
-            StdOp::NetSockaddrIn => IrType::Pointer,
-            StdOp::NetSocket
-            | StdOp::NetBind
-            | StdOp::NetListen
-            | StdOp::NetAccept
-            | StdOp::NetRecv
-            | StdOp::NetSend
-            | StdOp::NetClose => IrType::Number,
             StdOp::ProcPipe => IrType::Pointer,
-            StdOp::ProcExit => IrType::Void,
-            StdOp::ProcFork
-            | StdOp::ProcExec1
+            StdOp::ProcExec1
             | StdOp::ProcExec2
             | StdOp::ProcPipeRead
-            | StdOp::ProcPipeWrite
-            | StdOp::ProcWait => IrType::Number,
+            | StdOp::ProcPipeWrite => IrType::Number,
         }
     }
 }
@@ -250,114 +217,11 @@ pub fn check_call(
             }
             Ok(Ty::Number)
         }
-        StdOp::NetSockaddrIn => {
-            if n_args != 2 {
-                return Err("std.net.sockaddrIn accepts two arguments".into());
-            }
-            let port = arg_types[0];
-            let addr = arg_types[1];
-            if (port != Ty::Number && port != Ty::Any) || (addr != Ty::Number && addr != Ty::Any) {
-                return Err("std.net.sockaddrIn expects two number arguments (port, addr)".into());
+        StdOp::ProcPipe => {
+            if n_args != 0 {
+                return Err("std.process.pipe accepts no arguments".into());
             }
             Ok(Ty::Pointer)
-        }
-        StdOp::NetSocket => {
-            if n_args != 3 {
-                return Err("std.net.socket expects three arguments (domain, type, protocol)".into());
-            }
-            for t in arg_types {
-                if t != &Ty::Number && t != &Ty::Any {
-                    return Err(format!("std.net.socket expects number arguments, got {t:?}"));
-                }
-            }
-            Ok(Ty::Number)
-        }
-        StdOp::NetBind => {
-            if n_args != 3 {
-                return Err("std.net.bind expects three arguments (fd, addr, len)".into());
-            }
-            if arg_types[0] != Ty::Number && arg_types[0] != Ty::Any {
-                return Err(format!("std.net.bind expects a number fd, got {:?}", arg_types[0]));
-            }
-            if arg_types[1] != Ty::Pointer && arg_types[1] != Ty::Any {
-                return Err(format!("std.net.bind expects a Pointer addr, got {:?}", arg_types[1]));
-            }
-            if arg_types[2] != Ty::Number && arg_types[2] != Ty::Any {
-                return Err(format!("std.net.bind expects a number len, got {:?}", arg_types[2]));
-            }
-            Ok(Ty::Number)
-        }
-        StdOp::NetListen => {
-            if n_args != 2 {
-                return Err("std.net.listen expects two arguments (fd, backlog)".into());
-            }
-            for t in arg_types {
-                if t != &Ty::Number && t != &Ty::Any {
-                    return Err(format!("std.net.listen expects number arguments, got {t:?}"));
-                }
-            }
-            Ok(Ty::Number)
-        }
-        StdOp::NetAccept => {
-            if n_args != 1 {
-                return Err("std.net.accept expects one argument (fd)".into());
-            }
-            if arg_types[0] != Ty::Number && arg_types[0] != Ty::Any {
-                return Err(format!("std.net.accept expects a number fd, got {:?}", arg_types[0]));
-            }
-            Ok(Ty::Number)
-        }
-        StdOp::NetRecv => {
-            if n_args != 4 {
-                return Err("std.net.recv expects four arguments (fd, buf, n, flags)".into());
-            }
-            if arg_types[0] != Ty::Number && arg_types[0] != Ty::Any {
-                return Err(format!("std.net.recv expects a number fd, got {:?}", arg_types[0]));
-            }
-            if arg_types[1] != Ty::Pointer && arg_types[1] != Ty::Any {
-                return Err(format!("std.net.recv expects a Pointer buf, got {:?}", arg_types[1]));
-            }
-            for t in &arg_types[2..] {
-                if t != &Ty::Number && t != &Ty::Any {
-                    return Err(format!("std.net.recv expects number n/flags, got {t:?}"));
-                }
-            }
-            Ok(Ty::Number)
-        }
-        StdOp::NetSend => {
-            if n_args != 4 {
-                return Err("std.net.send expects four arguments (fd, buf, n, flags)".into());
-            }
-            if arg_types[0] != Ty::Number && arg_types[0] != Ty::Any {
-                return Err(format!("std.net.send expects a number fd, got {:?}", arg_types[0]));
-            }
-            if arg_types[1] != Ty::Pointer && arg_types[1] != Ty::Any {
-                return Err(format!("std.net.send expects a Pointer buf, got {:?}", arg_types[1]));
-            }
-            for t in &arg_types[2..] {
-                if t != &Ty::Number && t != &Ty::Any {
-                    return Err(format!("std.net.send expects number n/flags, got {t:?}"));
-                }
-            }
-            Ok(Ty::Number)
-        }
-        StdOp::NetClose => {
-            if n_args != 1 {
-                return Err("std.net.close expects one argument (fd)".into());
-            }
-            if arg_types[0] != Ty::Number && arg_types[0] != Ty::Any {
-                return Err(format!("std.net.close expects a number fd, got {:?}", arg_types[0]));
-            }
-            Ok(Ty::Number)
-        }
-        StdOp::ProcFork | StdOp::ProcPipe => {
-            if n_args != 0 {
-                return Err("std.process.fork/std.process.pipe accept no arguments".into());
-            }
-            Ok(match op {
-                StdOp::ProcPipe => Ty::Pointer,
-                _ => Ty::Number,
-            })
         }
         StdOp::ProcExec1 => {
             if n_args != 1 {
@@ -388,24 +252,6 @@ pub fn check_call(
             }
             Ok(Ty::Number)
         }
-        StdOp::ProcWait => {
-            if n_args != 1 {
-                return Err("std.process.wait accepts one argument (pid)".into());
-            }
-            if arg_types[0] != Ty::Number && arg_types[0] != Ty::Any {
-                return Err(format!("std.process.wait expects a number pid, got {:?}", arg_types[0]));
-            }
-            Ok(Ty::Number)
-        }
-        StdOp::ProcExit => {
-            if n_args != 1 {
-                return Err("std.process.exit accepts one argument (code)".into());
-            }
-            if arg_types[0] != Ty::Number && arg_types[0] != Ty::Any {
-                return Err(format!("std.process.exit expects a number code, got {:?}", arg_types[0]));
-            }
-            Ok(Ty::Void)
-        }
     }
 }
 
@@ -421,22 +267,11 @@ pub enum StdFunc {
     FromCString,
     StrLen,
     CharAt,
-    NetSockaddrIn,
-    NetSocket,
-    NetBind,
-    NetListen,
-    NetAccept,
-    NetRecv,
-    NetSend,
-    NetClose,
-    ProcFork,
     ProcExec1,
     ProcExec2,
     ProcPipe,
     ProcPipeRead,
     ProcPipeWrite,
-    ProcWait,
-    ProcExit,
 }
 
 /// Context surface the codegen's std.* emission needs from the compiler.
@@ -590,87 +425,6 @@ pub fn emit_std_call(
             let call = b.ins().call(callee, &[s, i]);
             Ok(b.func.dfg.inst_results(call)[0])
         }
-        StdOp::NetSockaddrIn => {
-            if args.len() != 2 {
-                return Err("std.net.sockaddrIn accepts two expressions".into());
-            }
-            let port = ctx.emit_expr(b, &args[0], vars)?;
-            let addr = ctx.emit_expr(b, &args[1], vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::NetSockaddrIn), b.func);
-            let call = b.ins().call(callee, &[port, addr]);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::NetSocket => {
-            if args.len() != 3 {
-                return Err("std.net.socket accepts three expressions".into());
-            }
-            let xs = emit_arg_exprs(ctx, b, args, vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::NetSocket), b.func);
-            let call = b.ins().call(callee, &xs);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::NetBind => {
-            if args.len() != 3 {
-                return Err("std.net.bind accepts three expressions".into());
-            }
-            let xs = emit_arg_exprs(ctx, b, args, vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::NetBind), b.func);
-            let call = b.ins().call(callee, &xs);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::NetListen => {
-            if args.len() != 2 {
-                return Err("std.net.listen accepts two expressions".into());
-            }
-            let xs = emit_arg_exprs(ctx, b, args, vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::NetListen), b.func);
-            let call = b.ins().call(callee, &xs);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::NetAccept => {
-            if args.len() != 1 {
-                return Err("std.net.accept accepts one expression".into());
-            }
-            let xs = emit_arg_exprs(ctx, b, args, vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::NetAccept), b.func);
-            let call = b.ins().call(callee, &xs);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::NetRecv => {
-            if args.len() != 4 {
-                return Err("std.net.recv accepts four expressions".into());
-            }
-            let xs = emit_arg_exprs(ctx, b, args, vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::NetRecv), b.func);
-            let call = b.ins().call(callee, &xs);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::NetSend => {
-            if args.len() != 4 {
-                return Err("std.net.send accepts four expressions".into());
-            }
-            let xs = emit_arg_exprs(ctx, b, args, vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::NetSend), b.func);
-            let call = b.ins().call(callee, &xs);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::NetClose => {
-            if args.len() != 1 {
-                return Err("std.net.close accepts one expression".into());
-            }
-            let xs = emit_arg_exprs(ctx, b, args, vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::NetClose), b.func);
-            let call = b.ins().call(callee, &xs);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::ProcFork => {
-            if !args.is_empty() {
-                return Err("std.process.fork accepts no expressions".into());
-            }
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::ProcFork), b.func);
-            let call = b.ins().call(callee, &[]);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
         StdOp::ProcExec1 => {
             if args.len() != 1 {
                 return Err("std.process.exec1 accepts one expression".into());
@@ -720,26 +474,6 @@ pub fn emit_std_call(
             let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::ProcPipeWrite), b.func);
             let call = b.ins().call(callee, &xs);
             Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::ProcWait => {
-            if args.len() != 1 {
-                return Err("std.process.wait accepts one expression".into());
-            }
-            let xs = emit_arg_exprs(ctx, b, args, vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::ProcWait), b.func);
-            let call = b.ins().call(callee, &xs);
-            Ok(b.func.dfg.inst_results(call)[0])
-        }
-        StdOp::ProcExit => {
-            if args.len() != 1 {
-                return Err("std.process.exit accepts one expression".into());
-            }
-            let code = ctx.emit_expr(b, &args[0], vars)?;
-            let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::ProcExit), b.func);
-            b.ins().call(callee, &[code]);
-            // nexa_process_exit does not return (and has no return value), so
-            // fabricate a dummy 0 result.
-            Ok(b.ins().iconst(types::I64, 0))
         }
         StdOp::FuncPtr => {
             if args.len() != 1 {

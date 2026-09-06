@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir;
 use crate::{Expr, Fun, Stmt, leak_str};
@@ -58,7 +58,7 @@ pub fn lex(s: &str) -> Result<Vec<Tok>, String> {
 
 pub fn resolve_ty_name(name: &str) -> Result<ir::IrType, String> { match name { "number" => Ok(ir::IrType::Number), "string" => Ok(ir::IrType::String), "boolean" => Ok(ir::IrType::Boolean), "Pointer" => Ok(ir::IrType::Pointer), other => Err(format!("unsupported generic type argument: {other}")) } }
 
-pub struct Parser { pub t: Vec<Tok>, pub p: usize, pub unsafe_depth: usize, pub extern_names: HashSet<String>, pub scope_type_param: Option<String>, pub obj_lit_index: usize }
+pub struct Parser { pub t: Vec<Tok>, pub p: usize, pub unsafe_depth: usize, pub extern_names: HashSet<String>, pub scope_type_param: Option<String>, pub obj_lit_index: usize, pub namespaces: HashMap<String, HashSet<String>> }
 impl Parser {
     pub fn peek(&self) -> &Tok { &self.t[self.p] }
     pub fn eat(&mut self) -> Tok { let x = self.t[self.p].clone(); self.p += 1; x }
@@ -156,25 +156,40 @@ impl Parser {
                         x = Expr::Call("std.log".into(), args);
                     } else if obj_name == "std" && (field == "log" || field == "in" || field == "parseNumber" || field == "toCString" || field == "fromCString" || field == "funcPtr" || field == "strlen" || field == "charAt" || field == "toF64" || field == "toF32" || field == "toInt") {
                         x = Expr::Call(format!("std.{field}"), args);
+                    } else if let Some(members) = self.namespaces.get(obj_name) {
+                        // `import * as ns`: resolve the call against the flat
+                        // top-level function name (namespace imports are static
+                        // aliases over the target module's exports).
+                        if !members.contains(&field) {
+return Err(format!("namespace `{obj_name}` does not export `{field}` (exported: {})", members.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+                        }
+                        x = Expr::Call(field, args);
                     } else {
                         x = Expr::MethodCall(Box::new(x), field, args);
                     }
                 } else if let Expr::FieldAccess(base, sub) = &x {
-                    let is_std_net = matches!(&**base, Expr::Var(oname) if oname == "std")
-                        && sub == "net"
-                        && matches!(field.as_str(), "sockaddrIn" | "socket" | "bind" | "listen" | "accept" | "recv" | "send" | "close");
                     let is_std_process = matches!(&**base, Expr::Var(oname) if oname == "std")
                         && sub == "process"
-                        && matches!(field.as_str(), "fork" | "exec1" | "exec2" | "pipe" | "pipeReadFd" | "pipeWriteFd" | "wait" | "exit");
-                    if is_std_net {
-                        x = Expr::Call(format!("std.net.{field}"), args);
-                    } else if is_std_process {
+                        && matches!(field.as_str(), "exec1" | "exec2" | "pipe" | "pipeReadFd" | "pipeWriteFd");
+                    if is_std_process {
                         x = Expr::Call(format!("std.process.{field}"), args);
                     } else {
                         x = Expr::MethodCall(Box::new(x), field, args);
                     }
                 } else {
                     x = Expr::MethodCall(Box::new(x), field, args);
+                }
+            } else if let Expr::Var(ref obj_name) = x {
+                // Non-call namespace member read: `ns.someGlobal` lowers to a
+                // bare reference to the flat top-level global.
+                if let Some(members) = self.namespaces.get(obj_name) {
+                    if members.contains(&field) {
+                        x = Expr::Var(field);
+                    } else {
+                        return Err(format!("namespace `{obj_name}` does not export `{field}` (exported: {})", members.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+                    }
+                } else {
+                    x = Expr::FieldAccess(Box::new(x), field);
                 }
             } else {
                 x = Expr::FieldAccess(Box::new(x), field);
@@ -230,7 +245,19 @@ impl Parser {
         match self.peek() {
             Tok::Id(name) if name == "new" => {
                 self.eat();
-                let class_name = self.id()?;
+                let mut class_name = self.id()?;
+                if let Some(members) = self.namespaces.get(&class_name).cloned() {
+                    // `new ns.Class(...)`: the namespace member is the class
+                    // name in the flat program.
+                    if matches!(self.peek(), Tok::Dot) {
+                        self.eat();
+                        let member = self.id()?;
+                        if !members.contains(&member) {
+                            return Err(format!("namespace `{class_name}` does not export `{member}` (exported: {})", members.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+                        }
+                        class_name = member;
+                    }
+                }
                 if matches!(self.peek(), Tok::Lt)
                     && matches!(self.t.get(self.p + 1), Some(Tok::Id(_)))
                     && matches!(self.t.get(self.p + 2), Some(Tok::Gt)) {
