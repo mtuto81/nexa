@@ -8,9 +8,58 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
 
 typedef int64_t (*NexaClosureCode)(int64_t env);
 typedef struct { int64_t code_ptr; int64_t env_ptr; } NxClosure;
+
+// Monotonic wall-clock time for Nexa's std/time module.
+int64_t nexa_time_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+// Synchronous file helpers used by bundled std/fs. The read buffer is copied
+// into a Nexa string by the wrapper before the raw buffer is freed.
+int64_t nexa_fs_read_file(int64_t path_ptr) {
+    const char *path = (const char *)(uintptr_t)(path_ptr & INT64_MAX);
+    FILE *f = fopen(path, "rb");
+    if (!f || fseek(f, 0, SEEK_END) != 0) { if (f) fclose(f); return 0; }
+    long size = ftell(f);
+    if (size < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
+    char *buf = (char *)malloc((size_t)size + 1);
+    if (!buf) { fclose(f); return 0; }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = '\0';
+    return (int64_t)(uintptr_t)buf;
+}
+
+int64_t nexa_fs_read_file_len(int64_t path_ptr) {
+    const char *path = (const char *)(uintptr_t)(path_ptr & INT64_MAX);
+    FILE *f = fopen(path, "rb");
+    if (!f || fseek(f, 0, SEEK_END) != 0) { if (f) fclose(f); return -1; }
+    long size = ftell(f);
+    fclose(f);
+    return size < 0 ? -1 : (int64_t)size;
+}
+
+int64_t nexa_fs_write_file(int64_t path_ptr, int64_t data_ptr, int64_t len, int64_t append) {
+    const char *path = (const char *)(uintptr_t)(path_ptr & INT64_MAX);
+    const char *data = (const char *)(uintptr_t)(data_ptr & INT64_MAX);
+    FILE *f = fopen(path, append ? "ab" : "wb");
+    if (!f) return -1;
+    size_t wrote = fwrite(data, 1, (size_t)len, f);
+    int failed = ferror(f);
+    fclose(f);
+    return failed || wrote != (size_t)len ? -1 : (int64_t)wrote;
+}
+
+int64_t nexa_fs_exists(int64_t path_ptr) {
+    const char *path = (const char *)(uintptr_t)(path_ptr & INT64_MAX);
+    return access(path, F_OK) == 0 ? 1 : 0;
+}
 
 /* Nexa strings carry an 8-byte length header immediately preceding the
    character buffer, mirroring the array layout: the tagged pointer points at

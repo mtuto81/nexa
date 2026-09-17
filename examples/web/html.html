@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mon Super Jeu 3D - Three.js</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #050510;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #fff;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.5);
+            pointer-events: none;
+        }
+        #gameover-screen {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(5, 5, 16, 0.85);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.5s ease;
+        }
+        #gameover-screen.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+        h1 { font-size: 48px; margin-bottom: 10px; color: #ff3366; text-shadow: 0 0 10px #ff3366; }
+        p { font-size: 20px; margin-bottom: 20px; }
+        button {
+            padding: 12px 30px;
+            font-size: 18px;
+            font-weight: bold;
+            background: #00ffcc;
+            border: none;
+            border-radius: 25px;
+            cursor: pointer;
+            box-shadow: 0 0 15px #00ffcc;
+            transition: transform 0.2s;
+        }
+        button:hover { transform: scale(1.1); }
+    </style>
+    <!-- Chargement de Three.js -->
+    <script src="https://cloudflare.com"></script>
+</head>
+<body>
+
+    <div id="ui">Score: <span id="score-val">0</span></div>
+
+    <div id="gameover-screen" id="gameover">
+        <h1>GAME OVER</h1>
+        <p>Votre score final : <span id="final-score">0</span></p>
+        <button onclick="resetGame()">Rejouer</button>
+    </div>
+
+    <script>
+        // --- CONFIGURATION INITIALE ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a1a);
+        scene.fog = new THREE.FogExp2(0x0a0a1a, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        // --- LUMIÈRES ---
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(0, 20, 10);
+        dirLight.castShadow = true;
+        scene.add(dirLight);
+
+        // --- VARIABLES DU JEU ---
+        let player, floor;
+        let obstacles = [];
+        let score = 0;
+        let isGameOver = false;
+        let gameSpeed = 0.4;
+        
+        // Physique joueur
+        let playerVelocityY = 0;
+        const gravity = -0.015;
+        const jumpForce = 0.35;
+        let isGrounded = true;
+
+        // Contrôles
+        const keys = { Left: false, Right: false };
+
+        // --- CRÉATION DU MONDE ---
+        function initWorld() {
+            // Piste / Sol
+            const floorGeo = new THREE.BoxGeometry(16, 1, 1000);
+            const floorMat = new THREE.MeshStandardMaterial({ color: 0x111122, roughness: 0.8 });
+            floor = new THREE.Mesh(floorGeo, floorMat);
+            floor.position.y = -0.5;
+            floor.receiveShadow = true;
+            scene.add(floor);
+
+            // Joueur (Cube Néon)
+            const playerGeo = new THREE.BoxGeometry(1.2, 1.2, 1.2);
+            const playerMat = new THREE.MeshStandardMaterial({ 
+                color: 0x00ffcc, 
+                emissive: 0x00ffcc, 
+                emissiveIntensity: 0.5,
+                roughness: 0.2 
+            });
+            player = new THREE.Mesh(playerGeo, playerMat);
+            player.position.set(0, 0.6, 0);
+            player.castShadow = true;
+            scene.add(player);
+
+            // Placement caméra
+            camera.position.set(0, 5, -7);
+            camera.lookAt(new THREE.Vector3(0, 2, 15));
+        }
+
+        // --- OBSTACLES ---
+        function spawnObstacle() {
+            if (isGameOver) return;
+
+            const width = Math.random() > 0.5 ? 3 : 1.5;
+            const geo = new THREE.BoxGeometry(width, Math.random() * 2 + 1, 1.5);
+            const mat = new THREE.MeshStandardMaterial({ color: 0xff3366, emissive: 0xff3366, emissiveIntensity: 0.3 });
+            const obstacle = new THREE.Mesh(geo, mat);
+
+            // Position aléatoire sur 3 voies
+            const lanes = [-4, 0, 4];
+            const randomLane = lanes[Math.floor(Math.random() * lanes.length)];
+            
+            obstacle.position.set(randomLane, geo.parameters.height / 2, 120);
+            obstacle.castShadow = true;
+            scene.add(obstacle);
+            obstacles.push(obstacle);
+
+            // Planifier le prochain obstacle avec un timing variable
+            setTimeout(spawnObstacle, Math.random() * 600 + 600);
+        }
+
+        // --- LOGIQUE ET ENTRÉES ---
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowLeft' || e.key === 'q' || e.key === 'Q') keys.Left = true;
+            if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') keys.Right = true;
+            if ((e.key === ' ' || e.key === 'ArrowUp') && isGrounded && !isGameOver) {
+                playerVelocityY = jumpForce;
+                isGrounded = false;
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (e.key === 'ArrowLeft' || e.key === 'q' || e.key === 'Q') keys.Left = false;
+            if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') keys.Right = false;
+        });
+
+        // --- BOUCLE DE JEU (TICK) ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (!isGameOver) {
+                // Déplacement latéral
+                if (keys.Left && player.position.x > -6) player.position.x -= 0.15;
+                if (keys.Right && player.position.x < 6) player.position.x += 0.15;
+
+                // Physique du saut
+                player.position.y += playerVelocityY;
+                playerVelocityY += gravity;
+
+                // Collision avec le sol
+                if (player.position.y <= 0.6) {
+                    player.position.y = 0.6;
+                    playerVelocityY = 0;
+                    isGrounded = true;
+                }
+
+                // Faire défiler les obstacles vers le joueur
+                for (let i = obstacles.length - 1; i >= 0; i--) {
+                    let obs = obstacles[i];
+                    obs.position.z -= gameSpeed;
+
+                    // Détection des collisions (Bounding Box simples)
+                    let playerBox = new THREE.Box3().setFromObject(player);
+                    let obsBox = new THREE.Box3().setFromObject(obs);
+
+                    if (playerBox.intersectsBox(obsBox)) {
+                        endGame();
+                    }
+
+                    // Nettoyage et mise à jour du score
+                    if (obs.position.z < -10) {
+                        scene.remove(obs);
+                        obstacles.splice(i, 1);
+                        score += 10;
+                        document.getElementById('score-val').innerText = score;
+                        
+                        // Augmentation progressive de la vitesse
+                        gameSpeed += 0.005;
+                    }
+                }
+                
+                // Animation de caméra subtile (effet de course)
+                camera.position.x = player.position.x * 0.3;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // --- ÉTATS DU JEU ---
+        function endGame() {
+            isGameOver = true;
+            document.getElementById('final-score').innerText = score;
+            document.getElementById('gameover-screen').classList.add('active');
+        }
+
+        function resetGame() {
+            // Nettoyer les obstacles existants
+            obstacles.forEach(obs => scene.remove(obs));
+            obstacles = [];
+            
+            // Réinitialiser les variables
+            score = 0;
+            gameSpeed = 0.4;
+            isGameOver = false;
+            player.position.set(0, 0.6, 0);
+            document.getElementById('score-val').innerText = score;
+            document.getElementById('gameover-screen').classList.remove('active');
+        }
+
+        // Redimensionnement de la fenêtre
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // --- LANCEMENT ---
+        initWorld();
+        spawnObstacle();
+        animate();
+    </script>
+</body>
+</html>

@@ -16,6 +16,12 @@ use codegen::Compiler;
 use ir::Ty;
 fn leak_str(s: &str) -> &'static str { Box::leak(s.to_string().into_boxed_str()) }
 
+// Keep the native runtime in the compiler binary, just like the bundled
+// std/*.ts modules. The linker still uses GCC, so materialize the embedded C
+// source in /tmp for the duration of the link instead of depending on the
+// user's current directory or the source checkout being present.
+const EMBEDDED_RUNTIME_C: &str = include_str!("../runtime.c");
+
 fn parse_swc_module(source: &str, filename: &str) -> Result<SwcModule, String> {
     let cm: Lrc<SourceMap> = Default::default();
     let fm = cm.new_source_file(FileName::Custom(filename.into()).into(), source.to_string());
@@ -519,7 +525,43 @@ fn subst_expr(e: &mut Expr, ty: ir::IrType) {
     }
 }
 
-fn run() -> Result<(), String> { let a: Vec<String> = env::args().collect(); if a.len() < 2 { return Err("usage: nexa <source.ts> [-o executable]".into()); } let flat = modules::resolve_and_flatten(Path::new(&a[1]))?; let (externs, clean) = extract_extern_blocks(&flat.code)?; let swc_src = blank_unsafe_markers(&clean)?; let module = parse_swc_module(&swc_src, &a[1])?; check_module_with_externs(&module, &externs, &flat.namespaces)?; let (classes, interfaces, functions, globals) = parse_nexa_with_externs_and_ns(&clean, &externs, &flat.namespaces)?; let mut functions = monomorphize(functions)?; inject_global_init(&mut functions, &globals); let ir = ir::lower_program(&functions); if env::var_os("NEXA_DUMP_IR").is_some() { eprintln!("{ir}"); } let mut c = Compiler::new()?; c.register_class_layouts(&classes)?; c.register_interface_layouts(&interfaces)?; c.declare_externs(&externs)?; c.compile(&classes, &functions, &globals)?; let obj = c.m.finish(); let objpath = "/tmp/nexa.o"; fs::write(objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?; let out = a.iter().position(|x| x == "-o").and_then(|i| a.get(i + 1)).cloned().unwrap_or_else(|| "a.out".into()); if !Path::new("runtime.c").exists() { return Err("runtime.c is missing".into()); } let status = Command::new("gcc").args([objpath, "runtime.c", "-o", &out]).status().map_err(|e| e.to_string())?; if !status.success() { return Err("link failed".into()); } println!("built {out}"); Ok(()) }
+fn run() -> Result<(), String> {
+    let raw: Vec<String> = env::args().skip(1).collect();
+    if raw.is_empty() { return Err("usage: nexa [build] [--debug] <source.ts> [-o executable]".into()); }
+    let debug = raw.iter().any(|x| x == "--debug");
+    let source = raw.iter().find(|x| !x.starts_with('-') && *x != "build").ok_or_else(|| "missing TypeScript source file".to_string())?.clone();
+    let out = raw.iter().position(|x| x == "-o").and_then(|i| raw.get(i + 1)).cloned().unwrap_or_else(|| "a.out".into());
+    let flat = modules::resolve_and_flatten(Path::new(&source))?;
+    let (externs, clean) = extract_extern_blocks(&flat.code)?;
+    let swc_src = blank_unsafe_markers(&clean)?;
+    let module = parse_swc_module(&swc_src, &source)?;
+    check_module_with_externs(&module, &externs, &flat.namespaces)?;
+    let (classes, interfaces, functions, globals) = parse_nexa_with_externs_and_ns(&clean, &externs, &flat.namespaces)?;
+    let mut functions = monomorphize(functions)?;
+    inject_global_init(&mut functions, &globals);
+    let ir = ir::lower_program(&functions);
+    if env::var_os("NEXA_DUMP_IR").is_some() { eprintln!("{ir}"); }
+    let mut c = Compiler::new()?;
+    c.register_class_layouts(&classes)?;
+    c.register_interface_layouts(&interfaces)?;
+    c.declare_externs(&externs)?;
+    c.compile(&classes, &functions, &globals)?;
+    let obj = c.m.finish();
+    let objpath = "/tmp/nexa.o";
+    fs::write(objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let runtime_path = format!("/tmp/nexa_runtime_{}.c", std::process::id());
+    fs::write(&runtime_path, EMBEDDED_RUNTIME_C).map_err(|e| format!("cannot materialize embedded runtime: {e}"))?;
+    let mut gcc = Command::new("gcc");
+    gcc.args([objpath, &runtime_path]);
+    if debug { gcc.arg("-g"); }
+    gcc.args(["-o", &out]);
+    let status = gcc.status().map_err(|e| e.to_string());
+    let _ = fs::remove_file(&runtime_path);
+    let status = status?;
+    if !status.success() { return Err("link failed".into()); }
+    println!("built {out}{}", if debug { " (debug symbols enabled; source-line DWARF pending)" } else { "" });
+    Ok(())
+}
 
 #[cfg(test)]
 mod safety_tests {
@@ -1262,6 +1304,26 @@ mod safety_tests {
         let out = build_and_run(&entry).expect("namespace import program must compile and run");
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines, vec!["42", "20"], "namespace calls must resolve to flat functions, got {lines:?}");
+    }
+
+    #[test]
+    fn std_mem_alloc_and_dealloc_acceptance() {
+        let source = r#"
+            import * as mem from "std/mem";
+
+            function main(): number {
+              let p: Pointer = mem.alloc(64);
+              mem.dealloc(p);
+              std.log(1);
+              return 0;
+            }
+
+            main();
+        "#;
+        let dir = scratch_dir("std_mem");
+        let entry = write_module(&dir, "main.ts", source);
+        let out = build_and_run(&entry).expect("std/mem program must compile and run");
+        assert_eq!(out, "1\n", "std/mem alloc/dealloc acceptance output");
     }
 
     #[test]
@@ -2675,4 +2737,3 @@ fn compile_with_externs(source: &str, externs: &HashMap<String, ExternSig>) -> R
     c.compile(&classes, &functions, &[])?;
     Ok(())
 }
-

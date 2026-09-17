@@ -35,6 +35,9 @@ struct LoadedModule {
 const BUNDLED_STD: &[(&str, &str)] = &[
     ("net", include_str!("../std/net.ts")),
     ("process", include_str!("../std/process.ts")),
+    ("time", include_str!("../std/time.ts")),
+    ("fs", include_str!("../std/fs.ts")),
+    ("mem", include_str!("../std/mem.ts")),
 ];
 const BUNDLED_STD_PREFIX: &str = "/nexa_std/";
 

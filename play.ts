@@ -1,3 +1,5 @@
+import * as net from "std/net";
+
 let string1: string = "Hello, World!";
 let string2: string = "Hello,"+ " World!";
 let string3: string = "Hello, Tiold!";
