@@ -12,6 +12,40 @@
 
 typedef int64_t (*NexaClosureCode)(int64_t env);
 typedef struct { int64_t code_ptr; int64_t env_ptr; } NxClosure;
+typedef struct { 
+    int64_t slot_count; 
+    int64_t cell_mask; 
+    int64_t slots[]; 
+} NxEnv;
+
+
+void nexa_closure_free(NxClosure *closure) {
+    // 1. Vérification de la validité de la fermeture
+    if (closure == NULL) return;
+ 
+    // 2. Libération de l'environnement et de ses cellules
+    if (closure->env_ptr != 0) {
+        NxEnv* env = (NxEnv *)(uintptr_t)closure->env_ptr;
+        
+        for (int64_t i = 0; i < env->slot_count; i++) {
+            // Vérifie si le i-ème bit du cell_mask est à 1
+            if ((env->cell_mask & ((int64_t)1 << i)) != 0) {
+                int64_t slot_value = env->slots[i];
+                // Sécurité additionnelle : s'assurer que le pointeur n'est pas nul
+                if (slot_value != 0) {
+                    free((void *)(uintptr_t)slot_value);
+                }
+            }
+        }
+        // Le free de l'environnement se fait IMPÉRATIVEMENT après la boucle
+        free(env);
+    } 
+    
+    // 3. Libération de la structure de fermeture elle-même
+    free(closure);
+}
+
+
 
 // Monotonic wall-clock time for Nexa's std/time module.
 int64_t nexa_time_now_ms(void) {
@@ -67,9 +101,24 @@ int64_t nexa_fs_exists(int64_t path_ptr) {
    remains NUL-terminated at str[len] for C interop (puts, toCString etc.). */
 #define NEXA_STR_LEN(p) (((int64_t *)(p))[-1])
 
-int64_t nexa_env_new(int64_t slots) { return (int64_t)(uintptr_t)calloc((size_t)slots, sizeof(int64_t)); }
-int64_t nexa_env_get(int64_t env, int64_t slot) { return ((int64_t *)(uintptr_t)env)[slot]; }
-int64_t nexa_env_set(int64_t env, int64_t slot, int64_t value) { ((int64_t *)(uintptr_t)env)[slot] = value; return value; }
+int64_t nexa_env_new(int64_t slot_count,int64_t cell_mask) { 
+    NxEnv *env = (NxEnv *)calloc(1, sizeof(NxEnv) + (size_t)slot_count * sizeof(int64_t));
+    if (!env) return 0;
+    env->slot_count = slot_count;
+    env->cell_mask = cell_mask;
+    return (int64_t)(uintptr_t)env;
+//good ?
+}
+
+
+
+int64_t nexa_env_get(int64_t env, int64_t slot) { 
+    NxEnv *capture_env = (NxEnv *)(uintptr_t)env;
+    return (capture_env)->slots[slot]; }
+int64_t nexa_env_set(int64_t env, int64_t slot, int64_t value) { 
+    NxEnv *capture_env = (NxEnv *)(uintptr_t)env;
+    (capture_env)->slots[slot] = value; return value; }
+
 int64_t nexa_cell_new(int64_t value) { int64_t *cell = malloc(sizeof(*cell)); if (!cell) return 0; *cell = value; return (int64_t)(uintptr_t)cell; }
 int64_t nexa_cell_get(int64_t cell) { return *(int64_t *)(uintptr_t)cell; }
 int64_t nexa_cell_set(int64_t cell, int64_t value) { *(int64_t *)(uintptr_t)cell = value; return value; }
