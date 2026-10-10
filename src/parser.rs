@@ -56,7 +56,7 @@ pub fn lex(s: &str) -> Result<Vec<Tok>, String> {
     out.push(Tok::Eof); Ok(out)
 }
 
-pub fn resolve_ty_name(name: &str) -> Result<ir::IrType, String> { match name { "number" => Ok(ir::IrType::Number), "string" => Ok(ir::IrType::String), "boolean" => Ok(ir::IrType::Boolean), "Pointer" => Ok(ir::IrType::Pointer), other => Err(format!("unsupported generic type argument: {other}")) } }
+pub fn resolve_ty_name(name: &str) -> Result<ir::IrType, String> { match name { "number" => Ok(ir::IrType::Number), "string" => Ok(ir::IrType::String), "boolean" => Ok(ir::IrType::Boolean), "Pointer" => Ok(ir::IrType::Pointer), other => Ok(ir::IrType::Class(leak_str(other))) } }
 
 pub struct Parser { pub t: Vec<Tok>, pub p: usize, pub unsafe_depth: usize, pub extern_names: HashSet<String>, pub scope_type_param: Option<String>, pub obj_lit_index: usize, pub namespaces: HashMap<String, HashSet<String>> }
 impl Parser {
@@ -239,6 +239,11 @@ return Err(format!("namespace `{obj_name}` does not export `{field}` (exported: 
                 x = Expr::Call(name, args);
             }
         }
+        while matches!(self.peek(), Tok::LParen) {
+            self.eat();
+            self.expect(|x| matches!(x, Tok::RParen), "Nexa v1 closure calls take no arguments")?;
+            x = Expr::CallClosure(Box::new(x));
+        }
         Ok(x)
     }
     pub fn atom(&mut self) -> Result<Expr, String> {
@@ -316,6 +321,7 @@ return Err(format!("namespace `{obj_name}` does not export `{field}` (exported: 
         Tok::Id(k) if k == "while" => { self.eat(); self.expect(|x| matches!(x, Tok::LParen), "expected (")?; let c = self.expr()?; self.expect(|x| matches!(x, Tok::RParen), "expected )")?; Ok(Stmt::While(c, self.block()?)) }
         Tok::Id(k) if k == "for" => { self.eat(); self.expect(|x| matches!(x, Tok::LParen), "expected (")?; if matches!(self.peek(), Tok::Id(x) if x == "let" || x == "const") { let is_const = matches!(self.peek(), Tok::Id(x) if x == "const"); self.eat(); let bname = self.id()?; let tp = self.scope_type_param.clone(); let annotation = self.annotation(tp.as_deref())?; if matches!(self.peek(), Tok::Id(x) if x == "of") { if !is_const { return Err("Nexa v1 for...of supports only `const` loop binders".into()); } self.eat(); let iter = self.expr()?; self.expect(|x| matches!(x, Tok::RParen), "expected )")?; return Ok(Stmt::ForOf(iter, bname, self.block()?)); } self.expect(|x| matches!(x, Tok::Eq), "expected =")?; let init_e = self.expr()?; self.expect(|x| matches!(x, Tok::Semi), "expected ;")?; let cond = self.expr()?; self.expect(|x| matches!(x, Tok::Semi), "expected ;")?; let update = { let n = self.id()?; self.expect(|x| matches!(x, Tok::Eq), "expected =")?; let e = self.expr()?; Stmt::Assign(n, e) }; self.expect(|x| matches!(x, Tok::RParen), "expected )")?; Ok(Stmt::For(Box::new(Stmt::Let(bname, annotation, init_e)), cond, Box::new(update), self.block()?)) } else { let init = { let e = self.expr()?; self.expect(|x| matches!(x, Tok::Semi), "expected ;")?; Stmt::Expr(e) }; let cond = self.expr()?; self.expect(|x| matches!(x, Tok::Semi), "expected ;")?; let update = { let n = self.id()?; self.expect(|x| matches!(x, Tok::Eq), "expected =")?; let e = self.expr()?; Stmt::Assign(n, e) }; self.expect(|x| matches!(x, Tok::RParen), "expected )")?; Ok(Stmt::For(Box::new(init), cond, Box::new(update), self.block()?)) } }
         Tok::Id(k) if k == "unsafe" => { self.eat(); self.expect(|x| matches!(x, Tok::LBrace), "`unsafe` must be followed by a { ... } block")?; self.unsafe_depth += 1; let mut body = Vec::new(); while !matches!(self.peek(), Tok::RBrace | Tok::Eof) { body.push(self.stmt()?); } self.unsafe_depth -= 1; self.expect(|x| matches!(x, Tok::RBrace), "expected } to close unsafe block")?; Ok(Stmt::Block(body)) }
+        Tok::Id(k) if k == "defer" => { self.eat(); Ok(Stmt::Defer(self.block()?)) }
         Tok::Id(_) => {
             let left = self.member_chain()?;
             if matches!(self.peek(), Tok::Eq) {
@@ -338,6 +344,6 @@ return Err(format!("namespace `{obj_name}` does not export `{field}` (exported: 
     fn class_decl(&mut self) -> Result<Fun, String> {
         Err("class declarations are handled at top level by parse_nexa".into())
     }
-    pub fn fun(&mut self) -> Result<Fun, String> { if self.id()? != "function" { return Err("expected function".into()); } let name = self.id()?; let type_param = if matches!(self.peek(), Tok::Lt) { self.eat(); let tp = self.id()?; self.expect(|x| matches!(x, Tok::Gt), "expected > after type parameter")?; Some(tp) } else { None }; self.expect(|x| matches!(x, Tok::LParen), "expected (")?; let mut params = Vec::new(); let mut param_types = Vec::new(); if !matches!(self.peek(), Tok::RParen) { loop { let p = self.id()?; let ty = self.annotation(type_param.as_deref())?.unwrap_or(ir::IrType::Any); params.push(p); param_types.push(ty); if matches!(self.peek(), Tok::Comma) { self.eat(); } else { break; } } } self.expect(|x| matches!(x, Tok::RParen), "expected )")?; let return_type = self.annotation(type_param.as_deref())?.unwrap_or(ir::IrType::Any); let saved = self.scope_type_param.clone(); self.scope_type_param = type_param.clone(); let body = self.block()?; self.scope_type_param = saved; Ok(Fun { name, params, param_types, return_type, body, type_param }) }
+    pub fn fun(&mut self) -> Result<Fun, String> { if self.id()? != "function" { return Err("expected function".into()); } let name = self.id()?; let type_param = if matches!(self.peek(), Tok::Lt) { self.eat(); let tp = self.id()?; if matches!(self.peek(), Tok::Id(x) if x == "extends") { self.eat(); let _bound = self.id()?; } self.expect(|x| matches!(x, Tok::Gt), "expected > after type parameter")?; Some(tp) } else { None }; self.expect(|x| matches!(x, Tok::LParen), "expected (")?; let mut params = Vec::new(); let mut param_types = Vec::new(); if !matches!(self.peek(), Tok::RParen) { loop { let p = self.id()?; let ty = self.annotation(type_param.as_deref())?.unwrap_or(ir::IrType::Any); params.push(p); param_types.push(ty); if matches!(self.peek(), Tok::Comma) { self.eat(); } else { break; } } } self.expect(|x| matches!(x, Tok::RParen), "expected )")?; let return_type = self.annotation(type_param.as_deref())?.unwrap_or(ir::IrType::Any); let saved = self.scope_type_param.clone(); self.scope_type_param = type_param.clone(); let body = self.block()?; self.scope_type_param = saved; Ok(Fun { name, params, param_types, return_type, body, type_param }) }
     fn program(&mut self) -> Result<Vec<Fun>, String> { let mut f = Vec::new(); while !matches!(self.peek(), Tok::Eof) { f.push(self.fun()?); } Ok(f) }
 }

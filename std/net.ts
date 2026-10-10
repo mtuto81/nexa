@@ -13,6 +13,7 @@
 extern "C" {
   function nexa_net_sockaddr_in(port: number, addr: number): Pointer;
   function nexa_net_socket(domain: number, ctype: number, protocol: number): number;
+  function nexa_net_setsockopt(fd: number, level: number, option: number, value: Pointer, length: number): number;
   function nexa_net_bind(fd: number, addr: Pointer, len: number): number;
   function nexa_net_listen(fd: number, backlog: number): number;
   function nexa_net_accept(fd: number): number;
@@ -27,6 +28,10 @@ export function sockaddrIn(port: number, addr: number): Pointer {
 
 export function socket(domain: number, ctype: number, protocol: number): number {
   return unsafe { nexa_net_socket(domain, ctype, protocol) };
+}
+
+export function setSockOpt(fd: number, level: number, option: number, value: Pointer, length: number): number {
+  return unsafe { nexa_net_setsockopt(fd, level, option, value, length) };
 }
 
 export function bind(fd: number, addr: Pointer, len: number): number {

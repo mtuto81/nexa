@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::types;
-use cranelift_codegen::ir::{FuncRef, Function, GlobalValue, InstBuilder, Value};
+use cranelift_codegen::ir::{FuncRef, Function, InstBuilder, Value};
 use cranelift_frontend::{FunctionBuilder, Variable};
-use cranelift_module::{DataId, FuncId};
+use cranelift_module::FuncId;
 
 use crate::checker::FnSig;
 use crate::ir::{IrType, Ty};
@@ -111,7 +111,7 @@ pub fn check_call(
                 return Err("std.log accepts one argument".into());
             }
             let t = arg_types[0];
-            if !matches!(t, Ty::Number | Ty::Boolean | Ty::String | Ty::F32 | Ty::F64 | Ty::Any) {
+            if !matches!(t, Ty::Number | Ty::Boolean | Ty::String | Ty::F32 | Ty::F64) {
                 return Err(format!("std.log does not accept {t:?} values in the raw ABI"));
             }
             Ok(Ty::Void)
@@ -257,7 +257,7 @@ pub fn check_call(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StdFunc {
-    PrintStr,
+    PrintCStr,
     PrintI64,
     PrintBool,
     PrintF64,
@@ -277,15 +277,12 @@ pub enum StdFunc {
 /// Context surface the codegen's std.* emission needs from the compiler.
 pub trait StdEmitter {
     fn emit_expr(&mut self, b: &mut FunctionBuilder, e: &Expr, vars: &HashMap<String, Variable>) -> Result<Value, String>;
-    fn expr_is_boolean(&self, e: &Expr) -> bool;
     // The statically-known type of an expression (codegen's expr_kind).
     fn expr_ir_kind(&self, _e: &Expr) -> IrType {
         IrType::Any
     }
     fn runtime_func(&self, f: StdFunc) -> FuncId;
     fn func_id(&self, name: &str) -> Option<FuncId>;
-    fn intern_string(&mut self, s: &[u8], null_terminated: bool) -> Result<DataId, String>;
-    fn declare_data_in_func(&mut self, id: DataId, func: &mut Function) -> GlobalValue;
     fn declare_func_in_func(&mut self, id: FuncId, func: &mut Function) -> FuncRef;
 }
 
@@ -301,26 +298,13 @@ pub fn emit_std_call(
             if args.len() != 1 {
                 return Err("std.log accepts one expression".into());
             }
-            if let Expr::Str(s) = &args[0] {
-                let id = ctx.intern_string(s, false)?;
-                let gv = ctx.declare_data_in_func(id, b.func);
-                let base = b.ins().symbol_value(types::I64, gv);
-                let hdr = b.ins().iconst(types::I64, 8);
-                let p = b.ins().iadd(base, hdr);
-                let l = b.ins().iconst(types::I64, s.len() as i64);
-                let callee = ctx.declare_func_in_func(ctx.runtime_func(StdFunc::PrintStr), b.func);
-                let call = b.ins().call(callee, &[p, l]);
-                return Ok(b.func.dfg.inst_results(call)[0]);
-            }
             let x = ctx.emit_expr(b, &args[0], vars)?;
-            let fid = if ctx.expr_is_boolean(&args[0]) {
-                ctx.runtime_func(StdFunc::PrintBool)
-            } else {
-                match ctx.expr_ir_kind(&args[0]) {
-                    IrType::F64 => ctx.runtime_func(StdFunc::PrintF64),
-                    IrType::F32 => ctx.runtime_func(StdFunc::PrintF32),
-                    _ => ctx.runtime_func(StdFunc::PrintI64),
-                }
+            let fid = match ctx.expr_ir_kind(&args[0]) {
+                IrType::String => ctx.runtime_func(StdFunc::PrintCStr),
+                IrType::Boolean => ctx.runtime_func(StdFunc::PrintBool),
+                IrType::F64 => ctx.runtime_func(StdFunc::PrintF64),
+                IrType::F32 => ctx.runtime_func(StdFunc::PrintF32),
+                _ => ctx.runtime_func(StdFunc::PrintI64),
             };
             let callee = ctx.declare_func_in_func(fid, b.func);
             let call = b.ins().call(callee, &[x]);

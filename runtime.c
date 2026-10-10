@@ -12,39 +12,47 @@
 
 typedef int64_t (*NexaClosureCode)(int64_t env);
 typedef struct { int64_t code_ptr; int64_t env_ptr; } NxClosure;
+typedef struct { uint64_t references; uint64_t kind; } NxRcHeader;
+enum { NEXA_RC_ENV = 1, NEXA_RC_CELL = 2 };
 typedef struct { 
     int64_t slot_count; 
     int64_t cell_mask; 
     int64_t slots[]; 
 } NxEnv;
 
-
-void nexa_closure_free(NxClosure *closure) {
-    // 1. Vérification de la validité de la fermeture
-    if (closure == NULL) return;
- 
-    // 2. Libération de l'environnement et de ses cellules
-    if (closure->env_ptr != 0) {
-        NxEnv* env = (NxEnv *)(uintptr_t)closure->env_ptr;
-        
-        for (int64_t i = 0; i < env->slot_count; i++) {
-            // Vérifie si le i-ème bit du cell_mask est à 1
-            if ((env->cell_mask & ((int64_t)1 << i)) != 0) {
-                int64_t slot_value = env->slots[i];
-                // Sécurité additionnelle : s'assurer que le pointeur n'est pas nul
-                if (slot_value != 0) {
-                    free((void *)(uintptr_t)slot_value);
-                }
-            }
-        }
-        // Le free de l'environnement se fait IMPÉRATIVEMENT après la boucle
-        free(env);
-    } 
-    
-    // 3. Libération de la structure de fermeture elle-même
-    free(closure);
+static int64_t nexa_live_env_count = 0;
+static int64_t nexa_live_cell_count = 0;
+static NxRcHeader *nexa_rc_header(int64_t ptr) {
+    return ptr == 0 ? NULL : ((NxRcHeader *)(uintptr_t)ptr) - 1;
 }
-
+static int64_t nexa_rc_alloc(size_t size, uint64_t kind) {
+    NxRcHeader *header = calloc(1, sizeof(*header) + size);
+    if (!header) return 0;
+    header->references = 1;
+    header->kind = kind;
+    return (int64_t)(uintptr_t)(header + 1);
+}
+void nexa_free(int64_t ptr) { free((void *)(uintptr_t)ptr); }
+void nexa_rc_inc(int64_t ptr) {
+    NxRcHeader *header = nexa_rc_header(ptr);
+    if (header) header->references++;
+}
+void nexa_rc_dec(int64_t ptr) {
+    NxRcHeader *header = nexa_rc_header(ptr);
+    if (!header || --header->references != 0) return;
+    if (header->kind == NEXA_RC_ENV) {
+        NxEnv *env = (NxEnv *)(uintptr_t)ptr;
+        nexa_live_env_count--;
+        for (int64_t i = 0; i < env->slot_count; i++) {
+            if ((env->cell_mask & (INT64_C(1) << i)) != 0) nexa_rc_dec(env->slots[i]);
+        }
+    } else if (header->kind == NEXA_RC_CELL) {
+        nexa_live_cell_count--;
+    }
+    nexa_free((int64_t)(uintptr_t)header);
+}
+int64_t nexa_live_closure_envs(void) { return nexa_live_env_count; }
+int64_t nexa_live_capture_cells(void) { return nexa_live_cell_count; }
 
 
 // Monotonic wall-clock time for Nexa's std/time module.
@@ -101,13 +109,14 @@ int64_t nexa_fs_exists(int64_t path_ptr) {
    remains NUL-terminated at str[len] for C interop (puts, toCString etc.). */
 #define NEXA_STR_LEN(p) (((int64_t *)(p))[-1])
 
-int64_t nexa_env_new(int64_t slot_count,int64_t cell_mask) { 
-    NxEnv *env = (NxEnv *)calloc(1, sizeof(NxEnv) + (size_t)slot_count * sizeof(int64_t));
+int64_t nexa_env_new(int64_t slot_count,int64_t cell_mask) {
+    if (slot_count < 0 || slot_count > 63) return 0;
+    NxEnv *env = (NxEnv *)(uintptr_t)nexa_rc_alloc(sizeof(NxEnv) + (size_t)slot_count * sizeof(int64_t), NEXA_RC_ENV);
     if (!env) return 0;
     env->slot_count = slot_count;
     env->cell_mask = cell_mask;
+    nexa_live_env_count++;
     return (int64_t)(uintptr_t)env;
-//good ?
 }
 
 
@@ -119,24 +128,28 @@ int64_t nexa_env_set(int64_t env, int64_t slot, int64_t value) {
     NxEnv *capture_env = (NxEnv *)(uintptr_t)env;
     (capture_env)->slots[slot] = value; return value; }
 
-int64_t nexa_cell_new(int64_t value) { int64_t *cell = malloc(sizeof(*cell)); if (!cell) return 0; *cell = value; return (int64_t)(uintptr_t)cell; }
+int64_t nexa_cell_new(int64_t value) { int64_t *cell = (int64_t *)(uintptr_t)nexa_rc_alloc(sizeof(*cell), NEXA_RC_CELL); if (!cell) return 0; *cell = value; nexa_live_cell_count++; return (int64_t)(uintptr_t)cell; }
 int64_t nexa_cell_get(int64_t cell) { return *(int64_t *)(uintptr_t)cell; }
 int64_t nexa_cell_set(int64_t cell, int64_t value) { *(int64_t *)(uintptr_t)cell = value; return value; }
-int64_t nexa_closure_new(int64_t code_ptr, int64_t env_ptr) { NxClosure *closure = malloc(sizeof(*closure)); if (!closure) return 0; closure->code_ptr = code_ptr; closure->env_ptr = env_ptr; return (int64_t)(uintptr_t)closure; }
+int64_t nexa_closure_new(int64_t code_ptr, int64_t env_ptr) { NxClosure *closure = malloc(sizeof(*closure)); if (!closure) { nexa_rc_dec(env_ptr); return 0; } closure->code_ptr = code_ptr; closure->env_ptr = env_ptr; return (int64_t)(uintptr_t)closure; }
 int64_t nexa_closure_call(int64_t closure_ptr) { NxClosure *closure = (NxClosure *)(uintptr_t)closure_ptr; return ((NexaClosureCode)(uintptr_t)closure->code_ptr)(closure->env_ptr); }
 
 int64_t nexa_class_new(int64_t size) { return (int64_t)(uintptr_t)calloc(1, (size_t)size); }
 
 int64_t nexa_print_bool(int64_t x) { puts(x ? "true" : "false"); return x; }
 int64_t nexa_print_i64(int64_t x) {
-    if (((uint64_t)x & UINT64_C(0x8000000000000000)) != 0) {
-        puts((const char *)(uintptr_t)(x & INT64_MAX));
-        return 0;
-    }
-    printf("%ld\n", (long)x);
+    printf("%lld\n", (long long)x);
     return x;
 }
-int64_t nexa_print_str(int64_t p, int64_t n) { fwrite((const void*)p, 1, (size_t)n, stdout); fputc('\n', stdout); return 0; }
+// Statically string-typed values alone reach this helper. The string tag is
+// removed and the stored length preserves embedded NUL bytes.
+int64_t nexa_print_cstr(int64_t tagged) {
+    const char *s = (const char *)(uintptr_t)(tagged & INT64_MAX);
+    size_t len = (size_t)NEXA_STR_LEN(s);
+    fwrite(s, 1, len, stdout);
+    fputc('\n', stdout);
+    return 0;
+}
 int64_t nexa_print_f64(double x) { printf("%g\n", x); return 0; }
 int64_t nexa_print_f32(float x) { printf("%g\n", x); return 0; }
 
@@ -297,6 +310,11 @@ int64_t nexa_net_sockaddr_in(int64_t port, int64_t addr) {
 
 int64_t nexa_net_socket(int64_t domain, int64_t type, int64_t protocol) {
     return (int64_t)socket((int)domain, (int)type, (int)protocol);
+}
+
+int64_t nexa_net_setsockopt(int64_t fd, int64_t level, int64_t option, int64_t value, int64_t length) {
+    return (int64_t)setsockopt((int)fd, (int)level, (int)option,
+                               (const void *)(uintptr_t)value, (socklen_t)length);
 }
 
 int64_t nexa_net_bind(int64_t fd, int64_t addr, int64_t len) {
