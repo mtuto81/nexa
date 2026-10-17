@@ -1,7 +1,7 @@
 use swc_common::{sync::Lrc, FileName, SourceMap};
 use swc_ecma_ast::{EsVersion, Module as SwcModule};
 use swc_ecma_parser::{lexer::Lexer, Parser as SwcParser, StringInput, Syntax, TsSyntax};
-use std::{collections::{HashMap, HashSet}, env, fs, path::Path, process::Command};
+use std::{collections::{HashMap, HashSet}, env, fs, path::{Path, PathBuf}, process::Command};
 mod ir;
 mod modules;
 mod parser;
@@ -21,6 +21,38 @@ fn leak_str(s: &str) -> &'static str { Box::leak(s.to_string().into_boxed_str())
 // source in /tmp for the duration of the link instead of depending on the
 // user's current directory or the source checkout being present.
 const EMBEDDED_RUNTIME_C: &str = include_str!("../runtime.c");
+
+/// A per-invocation scratch directory for the object and materialized runtime.
+/// Creating the directory atomically prevents concurrent compiler processes
+/// from sharing or overwriting each other's linker inputs.
+struct BuildTempDir {
+    path: PathBuf,
+}
+
+impl BuildTempDir {
+    fn new() -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let temp_root = env::temp_dir();
+        for _ in 0..100 {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = temp_root.join(format!("nexa-build-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("cannot create build temp directory: {error}")),
+            }
+        }
+        Err("cannot allocate a unique build temp directory after 100 attempts".into())
+    }
+}
+
+impl Drop for BuildTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
 
 fn parse_swc_module(source: &str, filename: &str) -> Result<SwcModule, String> {
     let cm: Lrc<SourceMap> = Default::default();
@@ -560,17 +592,16 @@ fn run() -> Result<(), String> {
     c.declare_externs(&externs)?;
     c.compile(&classes, &functions, &globals)?;
     let obj = c.m.finish();
-    let objpath = "/tmp/nexa.o";
-    fs::write(objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    let runtime_path = format!("/tmp/nexa_runtime_{}.c", std::process::id());
+    let build_temp = BuildTempDir::new()?;
+    let objpath = build_temp.path.join("nexa.o");
+    fs::write(&objpath, obj.emit().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let runtime_path = build_temp.path.join("runtime.c");
     fs::write(&runtime_path, EMBEDDED_RUNTIME_C).map_err(|e| format!("cannot materialize embedded runtime: {e}"))?;
     let mut gcc = Command::new("gcc");
-    gcc.args([objpath, &runtime_path]);
+    gcc.arg(&objpath).arg(&runtime_path);
     if debug { gcc.arg("-g"); }
     gcc.args(["-o", &out]);
-    let status = gcc.status().map_err(|e| e.to_string());
-    let _ = fs::remove_file(&runtime_path);
-    let status = status?;
+    let status = gcc.status().map_err(|e| e.to_string())?;
     if !status.success() { return Err("link failed".into()); }
     println!("built {out}{}", if debug { " (debug symbols enabled; source-line DWARF pending)" } else { "" });
     Ok(())
@@ -579,6 +610,20 @@ fn run() -> Result<(), String> {
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+
+    #[test]
+    fn build_temp_directories_are_unique_and_cleaned_up() {
+        let first = BuildTempDir::new().expect("first temp directory");
+        let second = BuildTempDir::new().expect("second temp directory");
+        assert_ne!(first.path, second.path);
+        assert!(first.path.is_dir());
+        assert!(second.path.is_dir());
+
+        let first_path = first.path.clone();
+        drop(first);
+        assert!(!first_path.exists(), "dropped temp directory should be removed");
+        assert!(second.path.is_dir(), "dropping one build dir must not affect another");
+    }
 
     #[test]
     fn swc_accepts_optional_chaining_but_checker_rejects_it_before_lowering() {
