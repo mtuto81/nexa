@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stddef.h>
+#include <assert.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -12,7 +13,13 @@
 
 typedef int64_t (*NexaClosureCode)(int64_t env);
 typedef struct { int64_t code_ptr; int64_t env_ptr; } NxClosure;
-typedef struct { uint64_t references; uint64_t kind; } NxRcHeader;
+typedef struct NxRcHeader {
+    uint64_t references;
+    uint64_t kind;
+#if defined(NEXA_RC_DEBUG) && !defined(NDEBUG)
+    struct NxRcHeader *debug_next;
+#endif
+} NxRcHeader;
 enum { NEXA_RC_ENV = 1, NEXA_RC_CELL = 2 };
 typedef struct { 
     int64_t slot_count; 
@@ -22,24 +29,78 @@ typedef struct {
 
 static int64_t nexa_live_env_count = 0;
 static int64_t nexa_live_cell_count = 0;
+#if defined(NEXA_RC_DEBUG) && !defined(NDEBUG)
+_Static_assert(sizeof(NxRcHeader) % 8 == 0, "RC header must preserve 8-byte payload alignment");
+static NxRcHeader *nexa_rc_live_headers = NULL;
+#endif
+
+#ifdef NEXA_TESTING
+static int64_t nexa_test_alloc_fail_countdown = -1;
+void nexa_test_fail_alloc_after(int64_t successful_allocations) {
+    nexa_test_alloc_fail_countdown = successful_allocations;
+}
+static int nexa_test_should_fail_alloc(void) {
+    if (nexa_test_alloc_fail_countdown < 0) return 0;
+    if (nexa_test_alloc_fail_countdown == 0) {
+        nexa_test_alloc_fail_countdown = -1;
+        return 1;
+    }
+    nexa_test_alloc_fail_countdown--;
+    return 0;
+}
+#else
+static int nexa_test_should_fail_alloc(void) { return 0; }
+#endif
+
+static void nexa_out_of_memory(const char *allocation) {
+    fprintf(stderr, "nexa: out of memory allocating %s\n", allocation);
+    fflush(stderr);
+    _Exit(70);
+}
+
 static NxRcHeader *nexa_rc_header(int64_t ptr) {
-    return ptr == 0 ? NULL : ((NxRcHeader *)(uintptr_t)ptr) - 1;
+    if (ptr == 0) return NULL;
+#if defined(NEXA_RC_DEBUG) && !defined(NDEBUG)
+    NxRcHeader *header = nexa_rc_live_headers;
+    while (header && (int64_t)(uintptr_t)(header + 1) != ptr) header = header->debug_next;
+    assert(header != NULL && "invalid or already-released Nexa RC pointer");
+    return header;
+#else
+    return ((NxRcHeader *)(uintptr_t)ptr) - 1;
+#endif
 }
 static int64_t nexa_rc_alloc(size_t size, uint64_t kind) {
+    if (nexa_test_should_fail_alloc()) return 0;
     NxRcHeader *header = calloc(1, sizeof(*header) + size);
     if (!header) return 0;
     header->references = 1;
     header->kind = kind;
+#if defined(NEXA_RC_DEBUG) && !defined(NDEBUG)
+    assert(kind == NEXA_RC_ENV || kind == NEXA_RC_CELL);
+    header->debug_next = nexa_rc_live_headers;
+    nexa_rc_live_headers = header;
+#endif
     return (int64_t)(uintptr_t)(header + 1);
 }
 void nexa_free(int64_t ptr) { free((void *)(uintptr_t)ptr); }
 void nexa_rc_inc(int64_t ptr) {
     NxRcHeader *header = nexa_rc_header(ptr);
-    if (header) header->references++;
+    if (!header) return;
+#if defined(NEXA_RC_DEBUG) && !defined(NDEBUG)
+    assert(header->kind == NEXA_RC_ENV || header->kind == NEXA_RC_CELL);
+    assert(header->references > 0 && "incrementing a dead Nexa RC allocation");
+    assert(header->references < UINT64_MAX && "Nexa RC count overflow");
+#endif
+    header->references++;
 }
 void nexa_rc_dec(int64_t ptr) {
     NxRcHeader *header = nexa_rc_header(ptr);
-    if (!header || --header->references != 0) return;
+    if (!header) return;
+#if defined(NEXA_RC_DEBUG) && !defined(NDEBUG)
+    assert(header->kind == NEXA_RC_ENV || header->kind == NEXA_RC_CELL);
+    assert(header->references > 0 && "decrementing a dead Nexa RC allocation");
+#endif
+    if (--header->references != 0) return;
     if (header->kind == NEXA_RC_ENV) {
         NxEnv *env = (NxEnv *)(uintptr_t)ptr;
         nexa_live_env_count--;
@@ -49,6 +110,12 @@ void nexa_rc_dec(int64_t ptr) {
     } else if (header->kind == NEXA_RC_CELL) {
         nexa_live_cell_count--;
     }
+#if defined(NEXA_RC_DEBUG) && !defined(NDEBUG)
+    NxRcHeader **link = &nexa_rc_live_headers;
+    while (*link && *link != header) link = &(*link)->debug_next;
+    assert(*link == header && "Nexa RC allocation missing from debug registry");
+    *link = header->debug_next;
+#endif
     nexa_free((int64_t)(uintptr_t)header);
 }
 int64_t nexa_live_closure_envs(void) { return nexa_live_env_count; }
@@ -110,9 +177,13 @@ int64_t nexa_fs_exists(int64_t path_ptr) {
 #define NEXA_STR_LEN(p) (((int64_t *)(p))[-1])
 
 int64_t nexa_env_new(int64_t slot_count,int64_t cell_mask) {
-    if (slot_count < 0 || slot_count > 63) return 0;
+    if (slot_count < 0 || slot_count > 63) {
+        fprintf(stderr, "nexa: invalid closure environment layout (%lld capture slots)\n", (long long)slot_count);
+        fflush(stderr);
+        _Exit(70);
+    }
     NxEnv *env = (NxEnv *)(uintptr_t)nexa_rc_alloc(sizeof(NxEnv) + (size_t)slot_count * sizeof(int64_t), NEXA_RC_ENV);
-    if (!env) return 0;
+    if (!env) nexa_out_of_memory("closure environment");
     env->slot_count = slot_count;
     env->cell_mask = cell_mask;
     nexa_live_env_count++;
@@ -128,10 +199,10 @@ int64_t nexa_env_set(int64_t env, int64_t slot, int64_t value) {
     NxEnv *capture_env = (NxEnv *)(uintptr_t)env;
     (capture_env)->slots[slot] = value; return value; }
 
-int64_t nexa_cell_new(int64_t value) { int64_t *cell = (int64_t *)(uintptr_t)nexa_rc_alloc(sizeof(*cell), NEXA_RC_CELL); if (!cell) return 0; *cell = value; nexa_live_cell_count++; return (int64_t)(uintptr_t)cell; }
+int64_t nexa_cell_new(int64_t value) { int64_t *cell = (int64_t *)(uintptr_t)nexa_rc_alloc(sizeof(*cell), NEXA_RC_CELL); if (!cell) nexa_out_of_memory("mutable capture cell"); *cell = value; nexa_live_cell_count++; return (int64_t)(uintptr_t)cell; }
 int64_t nexa_cell_get(int64_t cell) { return *(int64_t *)(uintptr_t)cell; }
 int64_t nexa_cell_set(int64_t cell, int64_t value) { *(int64_t *)(uintptr_t)cell = value; return value; }
-int64_t nexa_closure_new(int64_t code_ptr, int64_t env_ptr) { NxClosure *closure = malloc(sizeof(*closure)); if (!closure) { nexa_rc_dec(env_ptr); return 0; } closure->code_ptr = code_ptr; closure->env_ptr = env_ptr; return (int64_t)(uintptr_t)closure; }
+int64_t nexa_closure_new(int64_t code_ptr, int64_t env_ptr) { NxClosure *closure = nexa_test_should_fail_alloc() ? NULL : malloc(sizeof(*closure)); if (!closure) { nexa_rc_dec(env_ptr); nexa_out_of_memory("closure object"); } closure->code_ptr = code_ptr; closure->env_ptr = env_ptr; return (int64_t)(uintptr_t)closure; }
 int64_t nexa_closure_call(int64_t closure_ptr) { NxClosure *closure = (NxClosure *)(uintptr_t)closure_ptr; return ((NexaClosureCode)(uintptr_t)closure->code_ptr)(closure->env_ptr); }
 
 int64_t nexa_class_new(int64_t size) { return (int64_t)(uintptr_t)calloc(1, (size_t)size); }
